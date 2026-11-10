@@ -1,0 +1,12 @@
+# Manual example: a single lease attached to a pod you already created.
+# The demo driver (cmd/demo) does this in a loop automatically; this file is
+# for stepping through the flow by hand with kubectl.
+apiVersion: gnwes.io/v1alpha1
+kind: GPULease
+metadata:
+  name: actor-1-lease
+  namespace: gnwes-demo
+spec:
+  poolRef: demo-warm-pool
+  targetPod: actor-1
+  # ttlSeconds: 30

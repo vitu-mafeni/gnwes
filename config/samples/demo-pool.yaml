@@ -1,0 +1,10 @@
+apiVersion: gnwes.io/v1alpha1
+kind: GPUWorkerPool
+metadata:
+  name: demo-warm-pool
+  namespace: gnwes-demo
+spec:
+  poolSize: 3
+  gpuModel: A100-mock-40GB
+  slotInitMillis: 4000
+  attachLatencyMillis: 150

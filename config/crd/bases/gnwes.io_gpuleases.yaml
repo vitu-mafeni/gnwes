@@ -1,0 +1,120 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.5
+  name: gpuleases.gnwes.io
+spec:
+  group: gnwes.io
+  names:
+    kind: GPULease
+    listKind: GPULeaseList
+    plural: gpuleases
+    shortNames:
+    - gl
+    singular: gpulease
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.poolRef
+      name: Pool
+      type: string
+    - jsonPath: .spec.targetPod
+      name: Pod
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.slotID
+      name: Slot
+      type: string
+    - jsonPath: .status.attachLatencyMillis
+      name: AttachMs
+      type: integer
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: GPULease is a request to attach one warm GPU slot to a running
+          actor pod.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              GPULeaseSpec requests that one warm slot from PoolRef be attached to
+              TargetPod for the lifetime of this lease. This is the "lease a GPU by the
+              second" primitive: creating it attaches a slot in sub-second time, deleting
+              it (or letting the TTL expire) detaches and returns the slot to the pool
+              for immediate reuse by the next actor.
+            properties:
+              poolRef:
+                description: PoolRef is the name of the GPUWorkerPool (same namespace)
+                  to lease from.
+                type: string
+              targetPod:
+                description: |-
+                  TargetPod is the name of the actor pod (same namespace) the leased slot
+                  is attached to. In this demo build "attach" means annotating the pod
+                  with the assigned slot id, simulating CDI device injection into an
+                  already-running sandbox.
+                type: string
+              ttlSeconds:
+                description: |-
+                  TTLSeconds, if set, auto-releases the lease this many seconds after it
+                  became Bound, without the caller needing to delete it explicitly.
+                format: int32
+                type: integer
+            required:
+            - poolRef
+            - targetPod
+            type: object
+          status:
+            description: |-
+              GPULeaseStatus reports the outcome of the attach/detach flow, including the
+              measured attach latency the demo uses as its headline number.
+            properties:
+              attachLatencyMillis:
+                description: AttachLatencyMillis is wall-clock time from lease creation
+                  to Bound.
+                format: int64
+                type: integer
+              attachedAt:
+                format: date-time
+                type: string
+              message:
+                type: string
+              phase:
+                description: GPULeasePhase is the lifecycle phase of a lease.
+                type: string
+              releasedAt:
+                format: date-time
+                type: string
+              requestedAt:
+                format: date-time
+                type: string
+              slotID:
+                description: SlotID is the warm pool slot assigned to this lease once
+                  Bound.
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

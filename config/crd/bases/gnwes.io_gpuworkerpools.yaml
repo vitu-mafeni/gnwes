@@ -1,0 +1,178 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.5
+  name: gpuworkerpools.gnwes.io
+spec:
+  group: gnwes.io
+  names:
+    kind: GPUWorkerPool
+    listKind: GPUWorkerPoolList
+    plural: gpuworkerpools
+    shortNames:
+    - gwp
+    singular: gpuworkerpool
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.totalSlots
+      name: Total
+      type: integer
+    - jsonPath: .status.availableSlots
+      name: Available
+      type: integer
+    - jsonPath: .status.leasedSlots
+      name: Leased
+      type: integer
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          GPUWorkerPool is a warm pool of simulated GPU slots that GPULeases attach
+          to. It is the GNWES control-plane object representing "N GPUs kept warm
+          and ready" ahead of any actor needing one.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              GPUWorkerPoolSpec defines a pool of pre-warmed, simulated GPU slots that
+              GPULeases attach to and detach from in sub-second time. The pool itself is
+              slow to stand up (SlotInitMillis per slot) — that cost is paid once, ahead
+              of any agent needing a GPU, not on every agent's critical path.
+            properties:
+              attachLatencyMillis:
+                default: 150
+                description: |-
+                  AttachLatencyMillis simulates the CDI-injection attach cost paid when a
+                  GPULease binds an already-warm slot to a running actor pod. This models
+                  the fast path GNWES exists to deliver.
+                format: int32
+                type: integer
+              gpuModel:
+                description: |-
+                  GPUModel is a label for which simulated GPU model this pool represents
+                  (e.g. "A100-mock-40GB"). Cosmetic only in this demo build.
+                type: string
+              poolSize:
+                description: PoolSize is the number of warm GPU slots this pool maintains.
+                format: int32
+                minimum: 1
+                type: integer
+              slotInitMillis:
+                default: 4000
+                description: |-
+                  SlotInitMillis simulates the one-time cost of standing up a single warm
+                  slot (device init, driver load, VRAM clear) when the pool is created or
+                  scaled up. This models the real "cold" GPU-provisioning path.
+                format: int32
+                type: integer
+            required:
+            - poolSize
+            type: object
+          status:
+            description: GPUWorkerPoolStatus reports the current state of the warm
+              pool.
+            properties:
+              availableSlots:
+                description: AvailableSlots is the number of warm slots not currently
+                  leased.
+                format: int32
+                type: integer
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              leasedSlots:
+                description: LeasedSlots is the number of warm slots currently attached
+                  to an actor.
+                format: int32
+                type: integer
+              phase:
+                description: |-
+                  Phase is Warming while slots are still being initialized, Ready once
+                  every configured slot exists and can be leased.
+                type: string
+              totalSlots:
+                description: TotalSlots is the number of slots the pool has finished
+                  initializing.
+                format: int32
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

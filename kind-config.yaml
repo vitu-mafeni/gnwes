@@ -1,0 +1,7 @@
+# Single-node kind cluster for the GNWES demo. No real GPU needed — GNWES's
+# control plane (CRDs + controllers) is entirely software; only the
+# device/CDI layer it drives is simulated for this demo.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
