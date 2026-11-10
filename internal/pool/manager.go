@@ -163,6 +163,22 @@ func (p *Pool) Release(slotID, leaseKey string) {
 	}
 }
 
+// Transfer moves a Leased slot's ownership from fromKey to toKey, succeeding
+// only if the slot is currently leased under fromKey. This hands a
+// scheduling-gate reservation off to the GPULease that follows it without
+// releasing and re-acquiring, which would race against another actor
+// grabbing the slot in between.
+func (p *Pool) Transfer(slotID, fromKey, toKey string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.refreshLocked()
+	if s, ok := p.slots[slotID]; ok && s.State == SlotLeased && s.LeaseKey == fromKey {
+		s.LeaseKey = toKey
+		return true
+	}
+	return false
+}
+
 // Counts returns (total, available, leased, initializing) slot counts.
 func (p *Pool) Counts() (total, available, leased, initializing int32) {
 	p.mu.Lock()

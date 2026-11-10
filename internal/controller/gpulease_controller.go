@@ -40,7 +40,7 @@ type GPULeaseReconciler struct {
 
 // +kubebuilder:rbac:groups=gnwes.io,resources=gpuleases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gnwes.io,resources=gpuleases/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
 
 func (r *GPULeaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -114,7 +114,29 @@ func (r *GPULeaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{RequeueAfter: 250 * time.Millisecond}, nil
 	}
 
-	slotID, ok := p.Acquire(leaseKey)
+	var targetPod corev1.Pod
+	if err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: lease.Spec.TargetPod}, &targetPod); err != nil {
+		lease.Status.Phase = gnwesv1alpha1.LeasePhaseFailed
+		lease.Status.Message = fmt.Sprintf("target pod %q not found: %v", lease.Spec.TargetPod, err)
+		_ = r.Status().Update(ctx, &lease)
+		return ctrl.Result{}, nil
+	}
+
+	// If a PodGateReconciler already reserved a slot for this pod ahead of
+	// scheduling, inherit that exact slot instead of acquiring a second one
+	// — Transfer only succeeds while the reservation is still unclaimed, so
+	// this can never double-book a slot.
+	var slotID string
+	var ok bool
+	if reserved := targetPod.Annotations[annoReservedSlot]; reserved != "" {
+		reservationKey := "podgate/" + req.Namespace + "/" + lease.Spec.TargetPod
+		if p.Transfer(reserved, reservationKey, leaseKey) {
+			slotID, ok = reserved, true
+		}
+	}
+	if !ok {
+		slotID, ok = p.Acquire(leaseKey)
+	}
 	if !ok {
 		lease.Status.Phase = gnwesv1alpha1.LeasePhasePending
 		lease.Status.Message = "no warm slot available yet; waiting for one to free up"
@@ -127,7 +149,7 @@ func (r *GPULeaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// warm-up cost (SlotInitMillis) was.
 	time.Sleep(time.Duration(p.AttachLatencyMillis) * time.Millisecond)
 
-	if err := r.annotatePod(ctx, req.Namespace, lease.Spec.TargetPod, slotID); err != nil {
+	if err := r.annotatePod(ctx, &targetPod, slotID); err != nil {
 		p.Release(slotID, leaseKey)
 		lease.Status.Phase = gnwesv1alpha1.LeasePhaseFailed
 		lease.Status.Message = fmt.Sprintf("failed to attach to pod %q: %v", lease.Spec.TargetPod, err)
@@ -153,18 +175,15 @@ func (r *GPULeaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	return ctrl.Result{}, nil
 }
 
-func (r *GPULeaseReconciler) annotatePod(ctx context.Context, namespace, podName, slotID string) error {
-	var pod corev1.Pod
-	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: podName}, &pod); err != nil {
-		return err
-	}
+func (r *GPULeaseReconciler) annotatePod(ctx context.Context, pod *corev1.Pod, slotID string) error {
 	patch := client.MergeFrom(pod.DeepCopy())
 	if pod.Annotations == nil {
 		pod.Annotations = map[string]string{}
 	}
 	pod.Annotations[annoSlot] = slotID
 	pod.Annotations[annoAttachedAt] = time.Now().Format(time.RFC3339Nano)
-	return r.Patch(ctx, &pod, patch)
+	delete(pod.Annotations, annoReservedSlot)
+	return r.Patch(ctx, pod, patch)
 }
 
 func (r *GPULeaseReconciler) unannotatePod(ctx context.Context, namespace, podName string) {

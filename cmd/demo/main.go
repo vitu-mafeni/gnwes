@@ -28,6 +28,15 @@ import (
 	gnwesv1alpha1 "gnwes/api/v1alpha1"
 )
 
+// These must match the constants PodGateReconciler uses
+// (internal/controller/podgate_controller.go); kept local rather than
+// imported so the demo driver only depends on the public API convention
+// (label + scheduling gate name), not the controller package's internals.
+const (
+	gnwesGateName     = "gnwes.io/gpu-capacity"
+	gnwesPoolRefLabel = "gnwes.io/gpu-pool"
+)
+
 var scheme = runtime.NewScheme()
 
 func init() {
@@ -43,6 +52,7 @@ func main() {
 	slotInitMs := flag.Int("slot-init-ms", 4000, "simulated one-time cost to stand up one GPU slot")
 	attachMs := flag.Int("attach-ms", 150, "simulated CDI-injection attach cost")
 	workMs := flag.Int("work-ms", 100, "simulated time each actor spends doing GPU work before releasing")
+	gate := flag.Bool("gate", true, "hold each actor pod un-schedulable (scheduling gate) until a GPU slot is actually reserved for it")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -60,6 +70,12 @@ func main() {
 		slotInitMs: int32(*slotInitMs),
 		attachMs:   int32(*attachMs),
 		workMs:     time.Duration(*workMs) * time.Millisecond,
+		gate:       *gate,
+	}
+	if *gate {
+		fmt.Println("scheduling gate: ON — actor pods are held un-schedulable until a GPU slot is reserved for them")
+	} else {
+		fmt.Println("scheduling gate: OFF — actor pods are scheduled immediately, with no admission check against GPU capacity")
 	}
 
 	var warmLatencies, coldLatencies []time.Duration
@@ -94,6 +110,14 @@ type demoOpts struct {
 	slotInitMs int32
 	attachMs   int32
 	workMs     time.Duration
+	gate       bool
+}
+
+// podTimeout bounds how long we'll wait for an actor pod to reach Running.
+// With gating on, that wait includes however long it takes a slot to free up
+// (up to a full slotInitMs for a cold, just-created pool), so scale with it.
+func (o demoOpts) podTimeout() time.Duration {
+	return time.Duration(o.slotInitMs)*time.Millisecond + 25*time.Second
 }
 
 // runWarm stands up ONE pool once, then cycles every actor's lease through
@@ -113,8 +137,8 @@ func runWarm(ctx context.Context, o demoOpts) []time.Duration {
 		podName := fmt.Sprintf("actor-%d", i)
 		leaseName := fmt.Sprintf("actor-%d-lease", i)
 
-		must(createActorPod(ctx, o.c, o.ns, podName), "creating actor pod")
-		must(waitPodRunning(ctx, o.c, o.ns, podName, 30*time.Second), "waiting for actor pod to run")
+		must(createActorPod(ctx, o.c, o.ns, podName, poolName, o.gate), "creating actor pod")
+		must(waitPodRunning(ctx, o.c, o.ns, podName, o.podTimeout()), "waiting for actor pod to run")
 
 		start := time.Now()
 		must(createLease(ctx, o.c, o.ns, leaseName, poolName, podName, nil), "creating lease")
@@ -140,17 +164,24 @@ func runWarm(ctx context.Context, o demoOpts) []time.Duration {
 // critical path, the way a non-warm-pooled cluster behaves today.
 func runCold(ctx context.Context, o demoOpts) []time.Duration {
 	latencies := make([]time.Duration, 0, o.actors)
+	podTimeout := o.podTimeout()
 	for i := 1; i <= o.actors; i++ {
 		poolName := fmt.Sprintf("demo-cold-pool-%d", i)
 		podName := fmt.Sprintf("cold-actor-%d", i)
 		leaseName := fmt.Sprintf("cold-actor-%d-lease", i)
 
-		must(createActorPod(ctx, o.c, o.ns, podName), "creating actor pod")
-		must(waitPodRunning(ctx, o.c, o.ns, podName, 30*time.Second), "waiting for actor pod to run")
-
 		start := time.Now()
 		must(createPool(ctx, o.c, o.ns, poolName, 1, o.slotInitMs, o.attachMs), "creating dedicated pool")
-		must(waitPoolReady(ctx, o.c, o.ns, poolName, 60*time.Second), "waiting for dedicated pool")
+		// Pod is created right away, before the pool has warmed up. With
+		// gating on, the pod simply sits un-schedulable until the pool's one
+		// slot is ready and reserved for it — no separate wait needed. With
+		// gating off, nothing stops the pod from running immediately, so we
+		// fall back to explicitly waiting for the pool instead.
+		must(createActorPod(ctx, o.c, o.ns, podName, poolName, o.gate), "creating actor pod")
+		if !o.gate {
+			must(waitPoolReady(ctx, o.c, o.ns, poolName, 60*time.Second), "waiting for dedicated pool")
+		}
+		must(waitPodRunning(ctx, o.c, o.ns, podName, podTimeout), "waiting for actor pod to run")
 		must(createLease(ctx, o.c, o.ns, leaseName, poolName, podName, nil), "creating lease")
 		status, err := waitLeaseBound(ctx, o.c, o.ns, leaseName, 10*time.Second)
 		must(err, "waiting for lease to bind")
@@ -216,7 +247,10 @@ func deletePoolIfExists(ctx context.Context, c client.Client, ns, name string) e
 
 // createActorPod makes a minimal pod using the pause image, which kind
 // preloads on every node, so no image pull is needed for the demo to run.
-func createActorPod(ctx context.Context, c client.Client, ns, name string) error {
+// When gated, the pod carries the gnwes.io/gpu-capacity scheduling gate and
+// is held un-schedulable until PodGateReconciler reserves it a slot in
+// poolRef.
+func createActorPod(ctx context.Context, c client.Client, ns, name, poolRef string, gated bool) error {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: map[string]string{"app": "gnwes-demo-actor"}},
 		Spec: corev1.PodSpec{
@@ -225,6 +259,10 @@ func createActorPod(ctx context.Context, c client.Client, ns, name string) error
 				Image: "registry.k8s.io/pause:3.9",
 			}},
 		},
+	}
+	if gated {
+		pod.Labels[gnwesPoolRefLabel] = poolRef
+		pod.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: gnwesGateName}}
 	}
 	return c.Create(ctx, pod)
 }

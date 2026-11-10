@@ -24,12 +24,22 @@ is and isn't simulated and why.
 - **`internal/pool`** — the in-memory, mutex-protected slot bookkeeping
   (`Acquire`/`Release`/`Resize`) that both controllers share. This is the
   actual source of truth; CR status mirrors it for visibility.
-- **`internal/controller`** — the two reconcilers:
+- **`internal/controller`** — three reconcilers:
   - `GPUWorkerPoolReconciler` grows/shrinks the pool toward `spec.poolSize`
     and reports `Warming`/`Ready` status.
-  - `GPULeaseReconciler` acquires a slot, simulates the attach cost, annotates
-    the target pod with `gnwes.io/gpu-slot`, and releases the slot back to the
-    pool on delete or TTL expiry (via a finalizer, so cleanup always runs).
+  - `PodGateReconciler` — **scheduler gating / admission.** An actor pod
+    created with the `gnwes.io/gpu-capacity` scheduling gate (the stable,
+    GA `spec.schedulingGates` API — no scheduler plugin or kube-scheduler
+    fork) and a `gnwes.io/gpu-pool` label is held un-schedulable until this
+    reconciler actually reserves it a warm slot. Only then does it remove the
+    gate, so the default scheduler never binds (and the cluster never spends
+    node resources on) a GPU-needing actor that has nothing to attach to.
+  - `GPULeaseReconciler` inherits that reservation if one exists (via
+    `pool.Transfer`, race-free against another actor grabbing the slot in
+    between), otherwise acquires a slot itself; simulates the attach cost;
+    annotates the target pod with `gnwes.io/gpu-slot`; and releases the slot
+    back to the pool on delete or TTL expiry (via a finalizer, so cleanup
+    always runs).
 - **`cmd/manager`** — runs both controllers against whatever cluster your
   kubeconfig points at (no in-cluster Deployment needed for this demo).
 - **`cmd/demo`** — the demo driver: cycles ephemeral actor pods through
@@ -71,3 +81,4 @@ Tear down with `bash hack/down.sh`.
 | `-attach-ms` | `150` | simulated CDI-injection attach cost |
 | `-work-ms` | `100` | simulated GPU work time per actor before release |
 | `-namespace` | `gnwes-demo` | namespace to run in |
+| `-gate` | `true` | hold each actor pod un-schedulable until a GPU slot is reserved for it (scheduler gating); `-gate=false` reverts to no admission check, for comparison |

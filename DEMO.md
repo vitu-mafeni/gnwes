@@ -17,7 +17,35 @@ claim of measured performance on real GPUs.
 | Warm pool bookkeeping (acquire/release, race-free under concurrent leases) | **Real** — in-memory, mutex-protected | Same idea, same concurrency property |
 | "Standing up a GPU slot" cost (`slotInitMillis`) | **Simulated** — a sleep | Real device/driver init, VRAM clear, possibly microVM boot |
 | "Attaching a slot to a running actor" cost (`attachLatencyMillis`) | **Simulated** — a sleep, then a pod annotation patch | Real DRA ResourceClaim resolution + CDI device injection into a running sandbox |
-| Scheduler gating, fairness arbiter, predictive autotuner | **Not built** in this demo | Designed in the research docs (Area 1 Phase B / Area 2) |
+| Scheduler gating / admission (never schedule a GPU actor with nothing to attach to) | **Real** — the stable, GA `spec.schedulingGates` API holds the pod until a slot is reserved; no scheduler plugin or kube-scheduler fork | Same mechanism works at full scale; a production build might add a scheduler plugin for richer scoring, but doesn't need one for correctness |
+| Fairness arbiter, predictive autotuner | **Not built** in this demo | Designed in the research docs (Area 2) |
+
+### Scheduler gating, concretely
+
+Every actor pod `cmd/demo` creates (unless `-gate=false`) is born with:
+
+```yaml
+metadata:
+  labels: { gnwes.io/gpu-pool: demo-warm-pool }
+spec:
+  schedulingGates: [{ name: gnwes.io/gpu-capacity }]
+```
+
+A pod with a non-empty `schedulingGates` list is invisible to the default
+scheduler — it sits `Pending` with condition reason `SchedulingGated` — until
+every gate is removed. `PodGateReconciler` is the only thing that removes
+`gnwes.io/gpu-capacity`, and it only does so once it has actually reserved a
+slot in `gnwes.io/gpu-pool` for that pod (`pool.Acquire`, under a
+`podgate/<ns>/<pod>` key). The `GPULease` created for the pod afterwards
+inherits that exact reservation via `pool.Transfer` — it never calls `Acquire`
+again — so there is no window where two actors could be handed the same
+slot. This is the "admission & resolution" half of GNWES: the half that
+stops the cluster from scheduling (and billing) an ephemeral agent for a GPU
+that was never actually available.
+
+Turn it off with `-gate=false` to show the contrast live: pods schedule and
+run immediately, with no check that a slot exists for them at all — today's
+default behavior on most clusters.
 
 The number the demo produces — "leasing from a warm pool is ~Nx faster than
 provisioning a dedicated slot per actor" — is a **structural** result (it
@@ -75,6 +103,11 @@ GPU-attach numbers you want the simulation to track for the talk.
 - `kubectl get pod actor-1 -n gnwes-demo -o jsonpath='{.metadata.annotations}'`
   (while actor 1's lease is still bound) — shows the `gnwes.io/gpu-slot`
   annotation, standing in for real CDI device injection.
+- In another terminal while the demo runs, `kubectl get pods -n gnwes-demo -w`
+  — briefly, before each actor's gate clears, you can catch it `Pending` with
+  `kubectl get pod <name> -n gnwes-demo -o jsonpath='{.status.conditions}'`
+  showing reason `SchedulingGated`. Re-run with `-gate=false` to show the
+  same pods going straight to `Running` with no admission check at all.
 
 ## Tear down
 
