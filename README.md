@@ -48,6 +48,30 @@ is and isn't simulated and why.
   webhook that injects the `gnwes.io/gpu-capacity` scheduling gate onto any
   pod labeled `gnwes.io/gpu-pool`. Needed to gate pods GNWES doesn't create
   itself — see the Substrate integration below.
+- **`cmd/loadtest`** — a concurrency correctness check against a LIVE
+  cluster: many actors race a deliberately undersized pool at once, while a
+  monitor polls every Bound lease's slot ID and fails immediately on any
+  double-booking. See Testing below.
+
+## Testing
+
+- `go test ./...` — unit tests for `internal/pool` (including a dedicated
+  concurrency test, `TestConcurrentAcquireReleaseNeverDoubleBooks`, best run
+  with `-race`) and reconcile-level tests for all three controllers against a
+  fake client (`internal/controller/*_test.go`), covering the full attach/
+  release/TTL/reservation-inheritance/deletion-cleanup matrix, not just the
+  happy path.
+- `go run ./cmd/loadtest` — the same correctness property, but against the
+  REAL controllers on a real cluster, under real concurrent contention
+  (default: 40 actors, 10 at a time, racing a 3-slot pool). Verified clean:
+  `succeeded=40 failed=0 double-booking violations=0`.
+- `.github/workflows/ci.yaml` — build/vet/gofmt/`-race` unit tests on every
+  push/PR, plus a second job that stands up a real `kind` cluster and runs
+  `cmd/loadtest` against it as an integration gate.
+
+`-race` needs cgo, which needs a C compiler; this dev machine doesn't have
+one, so unit tests here run without it — CI's Linux runners do have one, so
+`-race` is enforced there.
 
 ## Real Agent Substrate integration
 
