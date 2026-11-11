@@ -138,19 +138,21 @@ running processes, `kubectl describe node <gpu-node>` for current
 `nvidia.com/gpu` allocation) before testing on a node with other active
 users, or test during a quiet window.
 
-**Honesty note:** this backend (`nvidia.go`) has been code-reviewed, built,
-and vetted, and its pure parsing/validation logic (`parseNvidiaSMIOutput`,
-`specDefinesDevice`) has unit test coverage (`nvidia_test.go`) — but as of
-this writing it has **not yet** been run end-to-end against real GPU
-hardware, because none exists in the environment this project was built in.
-Treat the first run on real hardware as the actual test of this path, and
-check:
-- the driver pod's logs show `using backend: nvidia (real GPU via
-  /usr/bin/nvidia-smi, reusing externally-managed CDI spec ...)` with no
-  error,
-- `kubectl describe resourceclaim` shows a real allocation (device
-  name/UUID/model matching your GPU),
-- and `nvidia-smi` inside the test pod actually works.
+**Verified on real hardware:** this path (`NVIDIA_CDI_MODE=existing`) has
+been run end-to-end on a real 3x NVIDIA TITAN RTX node managed by NVIDIA GPU
+Operator (CRI-O runtime, CDI enabled via `ClusterPolicy`). Confirmed:
+- the driver published all 3 real GPUs via `ResourceSlice`,
+- a `ResourceClaim` reached `allocated,reserved` against driver
+  `mock-gpu.gnwes.io`, device `gpu-0`,
+- and — the real proof — `nvidia-smi` run inside the test pod showed
+  **exactly the one GPU that claim was allocated** (matching PCI bus ID),
+  not all three physical GPUs on the node. Real DRA allocation and real CDI
+  device isolation, not just objects existing in etcd.
+
+The `NVIDIA_CDI_MODE=generate` path (no GPU Operator, bare-metal
+`nvidia-container-toolkit` install) is still unverified against real
+hardware — it's code-reviewed and unit-tested the same way, but hasn't had
+a matching cluster to run on.
 
 ## Reproducing this (mock backend, no hardware needed)
 

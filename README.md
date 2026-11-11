@@ -23,10 +23,12 @@ seeing the injection take effect. Only the device identity is mocked (no real
 NVIDIA hardware exists in this environment); everything else in that path —
 the API objects, the scheduling, the kubelet plugin protocol, the CDI
 file and its injection — is real. `cmd/mock-gpu-driver` now also has a real
-NVIDIA backend (`nvidia-smi` + `nvidia-ctk`) for running this same mechanism
-against an actual GPU node instead of the mock device — see
-`config/dra/README.md`, including that section's honesty note on what has and
-hasn't been run against real hardware.
+NVIDIA backend for running this same mechanism against an actual GPU node
+instead of the mock device, **verified end-to-end on a real 3x NVIDIA TITAN
+RTX node** (GPU Operator-managed, CRI-O runtime): a genuine `ResourceClaim`
+allocation followed by `nvidia-smi` inside the container showing exactly the
+one physical GPU that claim was allocated, not the node's other GPUs. See
+`config/dra/README.md`.
 
 The predictive/adaptive autoscaling loop and fairness arbiter from the
 research docs are still out of scope for this build.

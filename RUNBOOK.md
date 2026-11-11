@@ -131,16 +131,19 @@ Substrate `WorkerPoolPodTemplate` gap this surfaced.
 
 **Testing on a real GPU node instead of mock devices:** `cmd/mock-gpu-driver`
 now has a real NVIDIA backend (`GNWES_GPU_BACKEND=nvidia`) that discovers
-actual GPUs via `nvidia-smi` and generates a real CDI spec via `nvidia-ctk`
-(the real NVIDIA Container Toolkit tool) instead of a hand-written fake one.
-Use `config/dra/driver-real-gpu.yaml` + `config/dra/test-pod-real-gpu.yaml`
-in place of `driver.yaml`/`test-pod.yaml`, and verify with
+actual GPUs via `nvidia-smi` and gets them a real CDI spec either by
+generating one itself via `nvidia-ctk`, or (the common case, and the one
+used below) by reusing one an already-running GPU-management system
+maintains (`NVIDIA_CDI_MODE=existing`). Use
+`config/dra/driver-real-gpu.yaml` + `config/dra/test-pod-real-gpu.yaml` in
+place of `driver.yaml`/`test-pod.yaml`, and verify with
 `kubectl exec ... -- nvidia-smi` instead of the `env | grep` check above. See
 `config/dra/README.md`'s "Running on real GPU nodes" section for the full
-walkthrough and prerequisites — **this path is code-reviewed, built, and unit
-tested, but not yet run against real hardware**, since none exists in this
-project's dev environment; treat your first run on a real GPU node as the
-actual test of it.
+walkthrough and prerequisites — **this has been verified end-to-end on a
+real 3x NVIDIA TITAN RTX node** (GPU Operator-managed, CRI-O runtime): a
+genuine `ResourceClaim` allocation, followed by `nvidia-smi` inside the test
+pod showing exactly the one physical GPU that claim was allocated, not the
+node's other GPUs.
 
 ---
 
