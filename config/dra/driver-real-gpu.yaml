@@ -1,11 +1,16 @@
 # Same DRA driver as driver.yaml, but running the REAL backend
 # (GNWES_GPU_BACKEND=nvidia) against actual NVIDIA hardware instead of the
 # mock backend. Read "Running on real GPU nodes" in README.md before
-# applying this -- the mounts below assume the most common bare-metal layout
-# (NVIDIA driver + nvidia-container-toolkit installed directly on the host
-# via `apt install nvidia-driver-XXX nvidia-container-toolkit`), which this
-# project has not had real hardware to verify against; see the README for
-# what to check and adjust for your specific nodes.
+# applying this.
+#
+# Defaults below are set for a node managed by NVIDIA GPU Operator with CDI
+# enabled (ClusterPolicy .spec.cdi.enabled: true) -- NVIDIA_CDI_MODE=existing
+# reuses the operator's own device-plugin CDI spec (already present at
+# /var/run/cdi/k8s.device-plugin.nvidia.com-gpu.json on such a node) instead
+# of generating a second one, so this driver needs no nvidia-ctk access at
+# all. If your node instead has the driver + nvidia-container-toolkit
+# installed directly (no GPU Operator), switch to NVIDIA_CDI_MODE=generate
+# and mount nvidia-ctk too -- see the commented alternative below.
 #
 # Run this OR driver.yaml per node, never both: each registers a DRA driver
 # named mock-gpu.gnwes.io, and two instances would both try to manage the
@@ -81,14 +86,21 @@ spec:
               fieldPath: spec.nodeName
         - name: GNWES_GPU_BACKEND
           value: "nvidia"
+        - name: NVIDIA_CDI_MODE
+          value: "existing"
+        # Defaults in nvidia.go already match GPU Operator's own file
+        # (/var/run/cdi/k8s.device-plugin.nvidia.com-gpu.json, kind
+        # k8s.device-plugin.nvidia.com/gpu) -- override NVIDIA_CDI_EXISTING_SPEC
+        # / NVIDIA_CDI_KIND here if your operator install uses different ones
+        # (check `ls /var/run/cdi` and the "kind" field inside the file).
         - name: LD_LIBRARY_PATH
           value: "/usr/lib/x86_64-linux-gnu"
         securityContext:
           privileged: true # same rationale as driver.yaml: simplest way to
             # get write access to the host kubelet plugin/registry and CDI
             # directories, plus read access to the host's NVIDIA tools/libs
-            # below. A real driver would scope this down to exactly the
-            # mounts it needs.
+            # and /dev below. A real driver would scope this down to exactly
+            # the mounts it needs.
         volumeMounts:
         - name: plugins-registry
           mountPath: /var/lib/kubelet/plugins_registry
@@ -98,23 +110,36 @@ spec:
           mountPath: /etc/cdi
         - name: cdi-run
           mountPath: /var/run/cdi
-        # The host's real NVIDIA tools and driver libraries. This layout
-        # matches a standard bare-metal install. If your cluster instead
-        # runs NVIDIA GPU Operator (which stages the driver inside a
-        # container, not directly on the host), replace these three mounts
-        # with one pointing at its driver root instead -- typically:
-        #   hostPath: /run/nvidia/driver
-        # and point NVIDIA_SMI_PATH / NVIDIA_CTK_PATH / LD_LIBRARY_PATH at
-        # that root's usr/bin and usr/lib/x86_64-linux-gnu subdirectories.
+          readOnly: true # NVIDIA_CDI_MODE=existing only reads this; GPU
+            # Operator's own device plugin owns writing to it.
+        # nvidia-smi + the driver libraries it dlopen()s at runtime
+        # (libnvidia-ml.so.1 etc; confirmed present under this directory on
+        # a "nvidia.com/gpu.deploy.driver=pre-installed" node, i.e. the
+        # driver installed directly on the host rather than staged by GPU
+        # Operator in its own container). Mounting the whole directory
+        # (read-only) is simpler and more robust than guessing which
+        # individual .so files nvidia-smi needs.
         - name: nvidia-smi-bin
           mountPath: /usr/bin/nvidia-smi
-          readOnly: true
-        - name: nvidia-ctk-bin
-          mountPath: /usr/bin/nvidia-ctk
           readOnly: true
         - name: nvidia-driver-libs
           mountPath: /usr/lib/x86_64-linux-gnu
           readOnly: true
+        # The device nodes themselves (/dev/nvidia0, /dev/nvidiactl, ...),
+        # so nvidia-smi inside this container can actually talk to the
+        # driver, not just load its library.
+        - name: host-dev
+          mountPath: /dev
+        # NVIDIA_CDI_MODE=generate alternative (no GPU Operator, bare-metal
+        # nvidia-container-toolkit install instead): comment out cdi-run's
+        # readOnly above, and add:
+        #   - name: nvidia-ctk-bin
+        #     mountPath: /usr/bin/nvidia-ctk
+        #     readOnly: true
+        # with a matching hostPath volume -- and set NVIDIA_CTK_PATH if your
+        # install stages it somewhere other than /usr/bin (e.g. GPU
+        # Operator's own toolkit container installs it at
+        # /usr/local/nvidia/toolkit/nvidia-ctk instead).
       volumes:
       - name: plugins-registry
         hostPath:
@@ -136,11 +161,11 @@ spec:
         hostPath:
           path: /usr/bin/nvidia-smi
           type: File
-      - name: nvidia-ctk-bin
-        hostPath:
-          path: /usr/bin/nvidia-ctk
-          type: File
       - name: nvidia-driver-libs
         hostPath:
           path: /usr/lib/x86_64-linux-gnu
+          type: Directory
+      - name: host-dev
+        hostPath:
+          path: /dev
           type: Directory

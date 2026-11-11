@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"log"
 	"os"
@@ -15,22 +16,34 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
-// nvidiaBackend discovers real NVIDIA GPUs via nvidia-smi and prepares them
-// for containers via nvidia-ctk (NVIDIA Container Toolkit's own CDI
-// generator) — the same tools a real NVIDIA device plugin / GPU Operator
-// deployment uses, instead of a GNWES-authored CDI spec. It requires the
-// NVIDIA driver and nvidia-container-toolkit to already be installed on the
-// node, and nvidia-smi/nvidia-ctk to be reachable inside this container
-// (normally by bind-mounting them in from the host — see
-// config/dra/driver-real-gpu.yaml and that directory's README for exactly
-// what's required and how to verify it on real hardware).
+// nvidiaBackend discovers real NVIDIA GPUs via nvidia-smi. It prepares them
+// for containers one of two ways, chosen by NVIDIA_CDI_MODE:
+//
+//   - "generate" (default) — calls `nvidia-ctk cdi generate` itself to write
+//     a fresh CDI spec, for a bare-metal node with the NVIDIA driver and
+//     nvidia-container-toolkit installed but no GPU-management operator.
+//   - "existing" — reuses a CDI spec some other, already-running system
+//     manages (e.g. NVIDIA GPU Operator's own device plugin, which writes a
+//     fully correct, hook-laden spec to /var/run/cdi as part of normal
+//     operation on any node it manages). This avoids generating a second,
+//     redundant spec next to one already proven working, and means this
+//     backend needs no nvidia-ctk access at all in that mode.
+//
+// Either way, device discovery (nvidia-smi) and the DRA/CDI mechanism
+// (ResourceSlice, kubelet plugin protocol, CDI device ID handed to
+// kubelet/containerd-or-CRI-O) are unchanged — see config/dra/README.md's
+// "Running on real GPU nodes" section for prerequisites and how to verify.
 type nvidiaBackend struct {
 	nvidiaSMIPath string
 	nvidiaCTKPath string
 	cdiSpecPath   string
+	cdiMode       string // "generate" or "existing"
+	existingSpec  string
+	existingKind  string
 
-	mu        sync.Mutex
-	generated bool // whether this process has (re)generated the CDI spec yet
+	mu         sync.Mutex
+	generated  bool              // "generate" mode: whether this process has (re)generated the spec yet
+	uuidByName map[string]string // DRA device name (e.g. "gpu-0") -> real GPU UUID, populated by Devices()
 }
 
 func newNvidiaBackend() *nvidiaBackend {
@@ -38,6 +51,9 @@ func newNvidiaBackend() *nvidiaBackend {
 		nvidiaSMIPath: envOr("NVIDIA_SMI_PATH", "nvidia-smi"),
 		nvidiaCTKPath: envOr("NVIDIA_CTK_PATH", "nvidia-ctk"),
 		cdiSpecPath:   envOr("NVIDIA_CDI_SPEC_PATH", "/etc/cdi/nvidia.json"),
+		cdiMode:       envOr("NVIDIA_CDI_MODE", "generate"),
+		existingSpec:  envOr("NVIDIA_CDI_EXISTING_SPEC", "/var/run/cdi/k8s.device-plugin.nvidia.com-gpu.json"),
+		existingKind:  envOr("NVIDIA_CDI_KIND", "k8s.device-plugin.nvidia.com/gpu"),
 	}
 }
 
@@ -49,6 +65,9 @@ func envOr(key, fallback string) string {
 }
 
 func (b *nvidiaBackend) Name() string {
+	if b.cdiMode == "existing" {
+		return fmt.Sprintf("nvidia (real GPU via %s, reusing externally-managed CDI spec %s)", b.nvidiaSMIPath, b.existingSpec)
+	}
 	return fmt.Sprintf("nvidia (real GPU via %s + %s)", b.nvidiaSMIPath, b.nvidiaCTKPath)
 }
 
@@ -70,11 +89,15 @@ func (b *nvidiaBackend) Devices() ([]resourceapi.Device, error) {
 		return nil, fmt.Errorf("nvidia-smi reported zero GPUs on this node")
 	}
 
+	b.mu.Lock()
+	b.uuidByName = make(map[string]string, len(gpus))
 	devices := make([]resourceapi.Device, len(gpus))
 	for i, g := range gpus {
+		name := fmt.Sprintf("gpu-%s", g.index)
+		b.uuidByName[name] = g.uuid
 		model, uuid := g.model, g.uuid
 		devices[i] = resourceapi.Device{
-			Name: fmt.Sprintf("gpu-%s", g.index),
+			Name: name,
 			Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
 				"uuid":  {StringValue: &uuid},
 				"model": {StringValue: &model},
@@ -84,6 +107,7 @@ func (b *nvidiaBackend) Devices() ([]resourceapi.Device, error) {
 			},
 		}
 	}
+	b.mu.Unlock()
 	return devices, nil
 }
 
@@ -135,7 +159,7 @@ func parseNvidiaSMIOutput(output string) ([]nvidiaGPU, error) {
 
 // ensureCDISpec generates the real CDI spec covering every GPU on this node,
 // once per process, using nvidia-ctk itself rather than hand-writing one —
-// this is the exact tool NVIDIA's own device plugin and GPU Operator use.
+// used only in "generate" mode.
 func (b *nvidiaBackend) ensureCDISpec() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -156,6 +180,13 @@ func (b *nvidiaBackend) ensureCDISpec() error {
 }
 
 func (b *nvidiaBackend) Prepare(deviceName, claimUID string) (string, error) {
+	if b.cdiMode == "existing" {
+		return b.prepareExisting(deviceName)
+	}
+	return b.prepareGenerated(deviceName)
+}
+
+func (b *nvidiaBackend) prepareGenerated(deviceName string) (string, error) {
 	if err := b.ensureCDISpec(); err != nil {
 		return "", err
 	}
@@ -166,8 +197,39 @@ func (b *nvidiaBackend) Prepare(deviceName, claimUID string) (string, error) {
 	return fmt.Sprintf("nvidia.com/gpu=%s", index), nil
 }
 
+func (b *nvidiaBackend) prepareExisting(deviceName string) (string, error) {
+	b.mu.Lock()
+	uuid, ok := b.uuidByName[deviceName]
+	b.mu.Unlock()
+	if !ok {
+		return "", fmt.Errorf("no known GPU UUID for device %q (Devices() not called yet, or name mismatch)", deviceName)
+	}
+
+	// Sanity-check the externally-managed spec is actually there and really
+	// defines this device, rather than silently trusting a path that might
+	// be stale, empty, or belong to a differently-configured node.
+	data, err := os.ReadFile(b.existingSpec)
+	if err != nil {
+		return "", fmt.Errorf("reading externally-managed CDI spec %s: %w", b.existingSpec, err)
+	}
+	if !specDefinesDevice(data, uuid) {
+		return "", fmt.Errorf("externally-managed CDI spec %s has no device named %s", b.existingSpec, uuid)
+	}
+
+	return fmt.Sprintf("%s=%s", b.existingKind, uuid), nil
+}
+
+// specDefinesDevice reports whether specJSON (an already-generated CDI spec
+// file's raw bytes) defines a device with the given CDI device name. A
+// lightweight sanity check, not a full JSON parse, so this backend doesn't
+// need a dependency on whatever CDI spec-go version the external tool that
+// wrote the file happened to use.
+func specDefinesDevice(specJSON []byte, deviceName string) bool {
+	return bytes.Contains(specJSON, []byte(`"name":"`+deviceName+`"`))
+}
+
 func (b *nvidiaBackend) Unprepare(deviceName, claimUID string) {
-	// The generated CDI spec covers every GPU on the node and is shared
+	// Both modes' CDI specs cover every GPU on the node and are shared
 	// across all claims; Prepare created nothing claim-scoped, so there's
 	// nothing to clean up here (unlike mockBackend's one-spec-per-claim
 	// transient file).
