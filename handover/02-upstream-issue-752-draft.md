@@ -1,5 +1,14 @@
 # Handover 2/3 — Draft technical input for upstream issue #752
 
+**Scope decision (2026-11-11):** after Stage 3's research turned up a
+precise, sourced root cause for why gVisor can't do the Tier 1 CDI-spec-reuse
+trick (nvproxy's static, creation-time-only device registry — see
+`research/live-attach-poc/README.md`), the user chose to keep *this* draft
+narrowly focused on the data point it already has, rather than fold the
+gVisor finding in here. The gVisor root-cause writeup went into its own
+draft instead, for the issue it's actually more precisely about:
+[`02b-upstream-issue-13621-draft.md`](02b-upstream-issue-13621-draft.md).
+
 **Status: DRAFT WRITTEN, NOT POSTED.** Posting to a public GitHub issue is a
 "publish public content" action — it needs the user's explicit go-ahead on
 the *exact* final text before anyone posts it, and this session has not done
