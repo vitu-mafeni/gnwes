@@ -1,0 +1,25 @@
+# A plain pod (no GNWES, no DRA) used only to test whether a device can be
+# hot-attached to an ALREADY-RUNNING container without recreating the pod.
+# privileged:true deliberately mirrors config/dra/driver.yaml's own
+# justification: the cgroup v2 device BPF filter installed for a privileged
+# container already allows all devices, so this PoC can isolate and prove
+# just the "does the device node show up in an already-running container's
+# view of /dev" half of the problem, without also having to solve live
+# cgroup-v2 BPF device-filter updates in the same step. See README.md.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gnwes-hotattach-poc
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hotattach-target
+  namespace: gnwes-hotattach-poc
+spec:
+  containers:
+  - name: target
+    image: busybox:1.36
+    command: ["sleep", "infinity"]
+    securityContext:
+      privileged: true
