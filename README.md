@@ -148,23 +148,23 @@ pod-creation time — the vanilla K8s DRA model. Bridging that to Substrate's
 reuse-the-same-pod model is the genuine, still-open piece of work, not a
 detail either project has already solved.
 
-**`config/vmgpu` is a real attempt at closing exactly that gap** (not a
-drop-in fix — see its own README for the honest scope): `VMGPUAttachment`
-hot-attaches/detaches a real device on an already-running guest by flipping
-a field rather than creating/deleting a pod, targeting cloud-hypervisor
-specifically because Substrate's microVM worker already runs on it and it
-already ships the hotplug API this needs (unlike gVisor, confirmed
-architecturally blocked — see `research/live-attach-poc/README.md`). The
-whole mechanism is verified live against a real Kubernetes cluster; the VMM
-itself, in every run so far, is a local stand-in
-(`cmd/fakevmm`), not a real cloud-hypervisor+KVM instance or a real
-Substrate `ateworker-microvm` deployment — this dev environment has neither
-available. `internal/substratebridge` + `cmd/substrate-gpu-bridge` close the
-other half — polling one actor's state (`kubectl-ate get actor -o json`,
-since Substrate's `Actor` isn't a Kubernetes CRD) and flipping
-`VMGPUAttachment.spec.desiredState` to match, also verified live end-to-end
-with a stand-in for `kubectl-ate` (`cmd/fakekubectlate`). See
-`config/vmgpu/README.md` for exactly what that does and doesn't prove.
+**`config/vmgpu` closes exactly that gap, verified on real hardware**:
+`VMGPUAttachment` hot-attaches/detaches a real device on an already-running
+guest by flipping a field rather than creating/deleting a pod, targeting
+cloud-hypervisor specifically because Substrate's microVM worker already
+runs on it and it already ships the hotplug API this needs (unlike gVisor,
+confirmed architecturally blocked — see `research/live-attach-poc/README.md`).
+**On 2026-11-11, this repo's actual `chclient` code hot-attached a real
+NVIDIA TITAN RTX GPU into an already-running real Cloud Hypervisor guest on
+real bare-metal hardware, and hot-detached it again — confirmed from inside
+the guest both times.** `internal/substratebridge` + `cmd/substrate-gpu-bridge`
+close the other half — polling one actor's state (`kubectl-ate get actor -o
+json`, since Substrate's `Actor` isn't a Kubernetes CRD) and flipping
+`VMGPUAttachment.spec.desiredState` to match — also verified against a real
+Agent Substrate actor's real resume/suspend lifecycle, on the same real
+cluster. See `config/vmgpu/README.md` for exactly what's verified and what
+isn't, and `config/vmgpu/TESTING-WITH-REAL-AGENTS.md` for the staged plan
+to combine both proofs and extend this to real WorkerPools and notebooks.
 
 ## Quickstart
 

@@ -17,6 +17,16 @@ Agent Substrate's microVM worker (`ateworker-microvm`) already runs Kata on
 cloud-hypervisor, which has shipped exactly this hotplug/hot-unplug
 capability for a while.
 
+**Verified on real hardware (2026-11-11):** this mechanism's actual
+`chclient` code hot-attached a real NVIDIA TITAN RTX GPU into an
+already-running real Cloud Hypervisor guest, and hot-detached it again,
+confirmed from inside the guest both times (`lspci` showed the real device
+appear, then disappear, with no guest reboot). See
+`TESTING-WITH-REAL-AGENTS.md` for the staged plan to combine this with a
+real Agent Substrate actor and a real WorkerPool, and for the honest limits
+(checkpoint/restore across nodes is not solved, and isn't a GNWES gap to
+close — it's a hardware limitation).
+
 ## How this differs from GPUWorkerPool/GPULease, concretely
 
 | | GPUWorkerPool / GPULease | VFIOGPUPool / VMGPUAttachment |
@@ -113,13 +123,15 @@ substrate-gpu-bridge \
 
 ## What's NOT verified
 
-- **No real cloud-hypervisor instance, no real VFIO GPU, no real guest.**
-  This dev environment has no `/dev/kvm` (confirmed in
-  `research/live-attach-poc/README.md`) — nested virtualization isn't
-  available, so a real cloud-hypervisor VM couldn't be booted here at all.
-  Everything above the VMM boundary is real and tested, now including a
-  real Substrate actor's real resume/suspend lifecycle; the VMM itself, in
-  every test run so far, is still `cmd/fakevmm`, not cloud-hypervisor.
+- ~~No real cloud-hypervisor instance, no real VFIO GPU, no real guest~~ —
+  **resolved 2026-11-11** on a real bare-metal node (`dcn-gpu-0`, 3x TITAN
+  RTX, confirmed to have real `/dev/kvm`, unlike this dev environment).
+  Real `chclient` code hot-attached/detached a real GPU into/out of a real
+  Cloud Hypervisor guest, confirmed from inside the guest via `lspci` both
+  times. See `TESTING-WITH-REAL-AGENTS.md` for the full account, including
+  the real obstacles hit (NVIDIA driver live-unbind reproducibly wedging
+  while actively managed, fixed by excluding the GPU from `nvidia.ko` at
+  boot via an initramfs hook instead of live-unbinding it).
 - **No real Substrate `ateworker-microvm` deployment exercised.** The
   `config/substrate-integration` work so far (and the real-actor bridge
   test above) used Substrate's gVisor worker, not its microVM one. Wiring
