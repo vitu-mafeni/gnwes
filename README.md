@@ -4,13 +4,24 @@ A runnable proof-of-concept of the core GNWES idea from the research docs:
 **lease a GPU by the second out of a pre-warmed pool, instead of provisioning
 one from scratch for every ephemeral agent.**
 
-This is a conference-demo build, not the full research design. It implements
-the single headline flow — warm pool → sub-second lease attach → detach and
-reuse — using a **simulated** GPU device (no real NVIDIA hardware, no real
-DRA/CDI calls) so it runs anywhere `kind` + Docker run. The predictive/
-adaptive autoscaling loop, fairness arbiter, and real DRA+CDI wiring from the
-research docs are out of scope for this build; see `DEMO.md` for exactly what
-is and isn't simulated and why.
+This is a conference-demo build, not the full research design. The core
+headline flow — warm pool → sub-second lease attach → detach and reuse — runs
+anywhere `kind` + Docker, using a **simulated** GPU device (`cmd/manager` +
+`internal/controller`/`internal/pool`), documented honestly in `DEMO.md`.
+
+**`config/dra` adds a second, real mechanism alongside it**: a genuine
+Kubernetes DRA (Dynamic Resource Allocation) kubelet plugin
+(`cmd/mock-gpu-driver`) that publishes real devices via a real `ResourceSlice`,
+gets real `ResourceClaim`s allocated by the real scheduler, and writes a real
+CDI (Container Device Interface) spec that containerd genuinely injects into
+the container — verified by `kubectl exec`-ing into the running container and
+seeing the injection take effect. Only the device identity is mocked (no real
+NVIDIA hardware exists in this environment); everything else in that path —
+the API objects, the scheduling, the kubelet plugin protocol, the CDI
+file and its injection — is real. See `config/dra/README.md`.
+
+The predictive/adaptive autoscaling loop and fairness arbiter from the
+research docs are still out of scope for this build.
 
 ## What's here
 
