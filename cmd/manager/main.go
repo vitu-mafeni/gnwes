@@ -18,6 +18,7 @@ import (
 	gnwesv1alpha1 "gnwes/api/v1alpha1"
 	"gnwes/internal/controller"
 	"gnwes/internal/pool"
+	"gnwes/internal/vfiopool"
 )
 
 var scheme = runtime.NewScheme()
@@ -75,6 +76,32 @@ func main() {
 		Manager: poolManager,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PodGate")
+		os.Exit(1)
+	}
+
+	// Real-hardware counterparts to GPUWorkerPool/GPULease: VFIOGPUPool
+	// declares a node's actual VFIO-bound GPUs, and VMGPUAttachment
+	// hot-attaches/detaches one of them into/out of an already-running
+	// cloud-hypervisor guest (Agent Substrate's microVM worker runs Kata on
+	// cloud-hypervisor) -- the real mechanism GPULease only simulates. See
+	// config/vmgpu/README.md.
+	vfioManager := vfiopool.NewManager()
+
+	if err = (&controller.VFIOGPUPoolReconciler{
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		VFIOManager: vfioManager,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "VFIOGPUPool")
+		os.Exit(1)
+	}
+
+	if err = (&controller.VMGPUAttachmentReconciler{
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		VFIOManager: vfioManager,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "VMGPUAttachment")
 		os.Exit(1)
 	}
 

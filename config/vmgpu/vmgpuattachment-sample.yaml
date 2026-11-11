@@ -1,0 +1,22 @@
+# Example: hot-attach gpu-0 (from node-a-gpus) into a running
+# cloud-hypervisor guest. apiSocket must point at a REAL, already-running
+# cloud-hypervisor instance's api-socket (e.g. the one kata creates at
+# /run/vc/vm/<id>/clh-api.sock for a Substrate ateworker-microvm worker) --
+# or, for local testing without real hardware/KVM, `cmd/fakevmm`'s socket
+# (see README.md's "Testing without real hardware" section).
+#
+# Flip spec.desiredState between Attached and Detached (kubectl patch, or a
+# bridge watching Substrate actor resume/suspend) to drive the SAME object
+# through many attach/detach cycles -- this is what lets one VMGPUAttachment
+# track a worker that's reused across many actors, instead of create/delete
+# per use the way GPULease works.
+apiVersion: gnwes.io/v1alpha1
+kind: VMGPUAttachment
+metadata:
+  name: actor-worker-1-gpu
+  namespace: gnwes-vmgpu
+spec:
+  poolRef: node-a-gpus
+  # deviceRef: gpu-0   # uncomment to pin a specific device instead of "any available"
+  apiSocket: /run/vc/vm/REPLACE-ME/clh-api.sock
+  desiredState: Attached

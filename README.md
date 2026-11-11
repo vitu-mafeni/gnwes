@@ -35,17 +35,29 @@ research docs are still out of scope for this build.
 
 ## What's here
 
-- **`api/v1alpha1`** — two CRDs:
+- **`api/v1alpha1`** — four CRDs:
   - `GPUWorkerPool` — a pool of N warm, simulated GPU slots. Standing a slot
     up costs `slotInitMillis` (simulates real device/driver init) — paid once,
     ahead of any actor needing a GPU.
   - `GPULease` — a request to attach one warm slot to a running actor pod.
     Binding costs only `attachLatencyMillis` (simulates CDI injection into an
     already-running sandbox) — the fast path this research argues for.
-- **`internal/pool`** — the in-memory, mutex-protected slot bookkeeping
-  (`Acquire`/`Release`/`Resize`) that both controllers share. This is the
-  actual source of truth; CR status mirrors it for visibility.
-- **`internal/controller`** — three reconcilers:
+  - `VFIOGPUPool` — the real counterpart to `GPUWorkerPool`: a fixed
+    inventory of actual, physical VFIO-bound GPUs on one node.
+  - `VMGPUAttachment` — the real counterpart to `GPULease`: a request to
+    hot-attach (or hot-detach) one real device into/out of an
+    already-running cloud-hypervisor guest, driven by flipping
+    `spec.desiredState` rather than by creating/deleting the object.
+- **`internal/pool`** / **`internal/vfiopool`** — the in-memory,
+  mutex-protected device bookkeeping (`Acquire`/`Release`) each pair of
+  controllers shares — simulated slots and real VFIO devices respectively.
+  This is the actual source of truth; CR status mirrors it for visibility.
+- **`internal/chclient`** — a Go client for the subset of cloud-hypervisor's
+  REST VMM API needed to hot-attach/detach a real device (`vm.add-device`,
+  `vm.remove-device`), wire format taken from cloud-hypervisor's own OpenAPI
+  spec, not guessed. `cmd/fakevmm` is a stand-in VMM for testing this
+  without real cloud-hypervisor/KVM hardware available.
+- **`internal/controller`** — five reconcilers:
   - `GPUWorkerPoolReconciler` grows/shrinks the pool toward `spec.poolSize`
     and reports `Warming`/`Ready` status.
   - `PodGateReconciler` — **scheduler gating / admission.** An actor pod
@@ -61,7 +73,18 @@ research docs are still out of scope for this build.
     annotates the target pod with `gnwes.io/gpu-slot`; and releases the slot
     back to the pool on delete or TTL expiry (via a finalizer, so cleanup
     always runs).
-- **`cmd/manager`** — runs all three controllers against whatever cluster
+  - `VFIOGPUPoolReconciler` / `VMGPUAttachmentReconciler` — the REAL
+    counterpart to the two above: hot-attaches/detaches an actual VFIO GPU
+    device into/out of an already-running cloud-hypervisor guest via its
+    REST API (`internal/chclient`), driven by flipping
+    `VMGPUAttachment.spec.desiredState` rather than by creating/deleting the
+    object — so one object tracks a device across many attach/detach cycles
+    as a worker is reused, matching how Agent Substrate's microVM worker
+    actually operates. See `config/vmgpu/README.md` for what's verified
+    (the whole reconcile loop, live, against a real Kubernetes cluster —
+    just not yet against a real cloud-hypervisor+KVM instance, which this
+    dev environment doesn't have) and what isn't yet.
+- **`cmd/manager`** — runs all five controllers against whatever cluster
   your kubeconfig points at (no in-cluster Deployment needed for this demo).
 - **`cmd/demo`** — the demo driver: cycles ephemeral actor pods through
   leases and prints attach-latency numbers, in `warm`, `cold`, or `both` mode.
@@ -118,6 +141,20 @@ mechanism works end-to-end on real hardware, but only for a device bound at
 pod-creation time — the vanilla K8s DRA model. Bridging that to Substrate's
 reuse-the-same-pod model is the genuine, still-open piece of work, not a
 detail either project has already solved.
+
+**`config/vmgpu` is a real attempt at closing exactly that gap** (not a
+drop-in fix — see its own README for the honest scope): `VMGPUAttachment`
+hot-attaches/detaches a real device on an already-running guest by flipping
+a field rather than creating/deleting a pod, targeting cloud-hypervisor
+specifically because Substrate's microVM worker already runs on it and it
+already ships the hotplug API this needs (unlike gVisor, confirmed
+architecturally blocked — see `research/live-attach-poc/README.md`). The
+whole mechanism is verified live against a real Kubernetes cluster; the VMM
+itself, in every run so far, is a local stand-in
+(`cmd/fakevmm`), not a real cloud-hypervisor+KVM instance or a real
+Substrate `ateworker-microvm` deployment — this dev environment has neither
+available. See `config/vmgpu/README.md` for exactly what that does and
+doesn't prove.
 
 ## Quickstart
 

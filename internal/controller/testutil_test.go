@@ -29,7 +29,12 @@ func newFakeClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
 	return fake.NewClientBuilder().
 		WithScheme(testScheme(t)).
-		WithStatusSubresource(&gnwesv1alpha1.GPUWorkerPool{}, &gnwesv1alpha1.GPULease{}).
+		WithStatusSubresource(
+			&gnwesv1alpha1.GPUWorkerPool{},
+			&gnwesv1alpha1.GPULease{},
+			&gnwesv1alpha1.VFIOGPUPool{},
+			&gnwesv1alpha1.VMGPUAttachment{},
+		).
 		WithObjects(objs...).
 		Build()
 }

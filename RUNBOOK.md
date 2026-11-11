@@ -21,13 +21,14 @@ If `kind get clusters` is empty, skip to the per-tier "fresh setup" steps
 below. If clusters already exist, each tier's "quick re-check" command lets
 you confirm things still work without rebuilding anything.
 
-Three independent tiers live here, each with its own cluster/role:
+Four independent tiers live here, each with its own cluster/role:
 
 | Tier | What it proves | Needs |
 |---|---|---|
 | 1. Simulated demo | The core lease/attach/release mechanics and admission gating | Any plain `kind` cluster |
 | 2. Real DRA + CDI | The GPU attach step is a real Kubernetes mechanism, not a sleep | A cluster with DRA (`resource.k8s.io/v1`), e.g. `kindest/node:v1.34+` |
 | 3. Real Substrate integration | GNWES gating a real upstream Agent Substrate actor | A cluster running Substrate's control plane (heavy one-time setup) |
+| 4. Real VMGPUAttachment hot-attach | A real device hot-attaches/detaches into an already-running guest without recreating it | Any plain `kind` cluster, plus `cmd/fakevmm` (or a real cloud-hypervisor instance) |
 
 ---
 
@@ -268,7 +269,53 @@ long pole, etc.) already solved there.
 
 ---
 
-## 5. Concurrency / load test (the real one, not a unit test)
+## 5. Tier 4 — real VMGPUAttachment hot-attach (not pod-creation-time)
+
+Proves the actual mechanism Tier 2/3 can't: a real device hot-attaching into
+(and hot-detaching out of) an **already-running** guest, with the guest
+never recreated — driven by flipping one field, not by creating/deleting an
+object. See `config/vmgpu/README.md` for the full picture of what this does
+and doesn't prove (short version: the reconcile loop is real and verified
+live; the VMM underneath it, so far, is always `cmd/fakevmm`, a local
+stand-in — no real cloud-hypervisor/KVM instance has been available to test
+against in this environment).
+
+```bash
+cd /d/codes/gnwes
+go build -o fakevmm ./cmd/fakevmm
+./fakevmm -socket ./fvmm.sock &   # keep this path short -- AF_UNIX's ~100-byte limit
+
+kubectl apply -f config/crd/bases/gnwes.io_vfiogpupools.yaml
+kubectl apply -f config/crd/bases/gnwes.io_vmgpuattachments.yaml
+kubectl create namespace gnwes-vmgpu
+kubectl apply -f config/vmgpu/vfiogpupool-sample.yaml
+# edit config/vmgpu/vmgpuattachment-sample.yaml's apiSocket to fvmm.sock's
+# absolute path first, then:
+kubectl apply -f config/vmgpu/vmgpuattachment-sample.yaml
+
+go run ./cmd/manager   # against whatever context your cluster is on
+
+kubectl get vmgpuattachment -n gnwes-vmgpu -o wide
+```
+
+Expect `PHASE` to reach `Attached` with a real `DEVICE`/`GUESTBDF` within
+milliseconds. Flip it back:
+
+```bash
+kubectl patch vmgpuattachment actor-worker-1-gpu -n gnwes-vmgpu \
+  --type=merge -p '{"spec":{"desiredState":"Detached"}}'
+kubectl get vmgpuattachment -n gnwes-vmgpu -o wide   # PHASE -> Detached
+```
+
+**Cleanup:** stop `cmd/manager` only *after* every `VMGPUAttachment` in the
+namespace is `Detached` (or deleted while `cmd/manager` is still running) —
+otherwise its finalizer never gets removed and `kubectl delete namespace`
+hangs `Terminating` forever. See `config/vmgpu/README.md`'s Troubleshooting
+section for the fix if this happens anyway.
+
+---
+
+## 6. Concurrency / load test (the real one, not a unit test)
 
 Needs a manager running against whatever context is current. Uses
 `gnwes-demo` by default below, but works against any cluster with GNWES's

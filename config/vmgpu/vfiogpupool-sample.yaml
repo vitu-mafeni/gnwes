@@ -1,0 +1,15 @@
+# Example: a node's real VFIO-bound GPU inventory. Nothing discovers these
+# automatically (unlike GPU Operator's own device plugin) -- list the
+# devices this node actually has VFIO-bound, by their host sysfs path.
+# Finding them: on the node, `lspci -Dnn | grep -i nvidia` lists the PCI
+# addresses; `/sys/bus/pci/devices/<address>/` is the PCIPath each needs.
+apiVersion: gnwes.io/v1alpha1
+kind: VFIOGPUPool
+metadata:
+  name: node-a-gpus
+  namespace: gnwes-vmgpu
+spec:
+  nodeName: node-a
+  devices:
+  - id: gpu-0
+    pciPath: /sys/bus/pci/devices/0000:01:00.0/

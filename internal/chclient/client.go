@@ -1,0 +1,212 @@
+// Package chclient is a Go client for the subset of Cloud Hypervisor's REST
+// VMM API needed to hot-attach/detach a real VFIO (GPU) device to/from an
+// already-running guest: /api/v1/vmm.ping (readiness/liveness) and the
+// device hotplug pair, /api/v1/vm.add-device and /api/v1/vm.remove-device.
+//
+// This is new, independent code -- it does not import Agent Substrate's own
+// internal/ch package (a different Go module's internal package, not
+// importable anyway) -- but it deliberately mirrors that package's transport
+// approach (HTTP/1.1 over the VMM's unix api-socket, one fresh connection per
+// request) since that choice is already proven correct against a real
+// cloud-hypervisor instance there. See research/live-attach-poc/README.md
+// for why this exists: Substrate's microVM worker (ateworker-microvm) runs
+// Kata on cloud-hypervisor, and cloud-hypervisor's hotplug API is the one
+// concrete, already-shipped mechanism found that can attach a device to an
+// actor's sandbox without recreating it.
+//
+// Request/response shapes here were taken directly from cloud-hypervisor's
+// own OpenAPI spec (vmm/src/api/openapi/cloud-hypervisor.yaml, DeviceConfig /
+// VmRemoveDevice / PciDeviceInfo) and docs/hotplug.md, not guessed.
+package chclient
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"time"
+)
+
+// apiBase is a placeholder host; the real transport always dials the unix
+// api-socket, so the host portion of the URL is ignored.
+const apiBase = "http://localhost"
+
+// Client talks to one cloud-hypervisor VMM over its unix api-socket (e.g.
+// the socket kata creates at /run/vc/vm/<id>/clh-api.sock).
+type Client struct {
+	http *http.Client
+}
+
+// NewClient returns a Client bound to a cloud-hypervisor api-socket path.
+// The socket need not exist yet; use WaitReady to block until the VMM
+// answers.
+func NewClient(socketPath string) *Client {
+	return &Client{
+		http: &http.Client{
+			Transport: &http.Transport{
+				// cloud-hypervisor's API server closes idle connections;
+				// force a fresh connection per request rather than risk
+				// reusing one that's already been closed server-side
+				// (the same workaround Substrate's own ch package applies,
+				// for the same observed symptom).
+				DisableKeepAlives: true,
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					var d net.Dialer
+					return d.DialContext(ctx, "unix", socketPath)
+				},
+			},
+		},
+	}
+}
+
+// VMMInfo is what vmm.ping reports about the running VMM.
+type VMMInfo struct {
+	Version      string   `json:"version"`
+	BuildVersion string   `json:"build_version"`
+	Features     []string `json:"features"`
+}
+
+// Ping reports what the VMM says about itself, or an error if the
+// api-socket does not answer vmm.ping.
+func (c *Client) Ping(ctx context.Context) (VMMInfo, error) {
+	var info VMMInfo
+	err := c.getJSON(ctx, "/api/v1/vmm.ping", &info)
+	return info, err
+}
+
+// WaitReady blocks until the api-socket answers vmm.ping or the deadline
+// passes.
+func (c *Client) WaitReady(ctx context.Context, deadline time.Duration) (VMMInfo, error) {
+	end := time.Now().Add(deadline)
+	for {
+		info, err := c.Ping(ctx)
+		if err == nil {
+			return info, nil
+		}
+		if !time.Now().Before(end) {
+			return VMMInfo{}, fmt.Errorf("cloud-hypervisor api socket not ready after %s: %w", deadline, err)
+		}
+		select {
+		case <-ctx.Done():
+			return VMMInfo{}, ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// IommuType is the virtual IOMMU a hotplugged device is attached to; "Off"
+// (cloud-hypervisor's default) is what a plain VFIO passthrough device
+// normally uses.
+type IommuType string
+
+const (
+	IommuOff    IommuType = "Off"
+	IommuVirtio IommuType = "Virtio"
+	IommuSmmuv3 IommuType = "Smmuv3"
+)
+
+// DeviceConfig is the request body of PUT /api/v1/vm.add-device. Path is the
+// VFIO device's sysfs path (e.g. "/sys/bus/pci/devices/0000:01:00.0/"); ID,
+// if set, is the identifier used later to remove it -- leave it empty to let
+// cloud-hypervisor assign one, but then its own response (or a subsequent
+// vm.info) is the only way to learn what it picked, so callers that need to
+// remove the device later should normally set ID themselves.
+type DeviceConfig struct {
+	Path  string    `json:"path,omitempty"`
+	Iommu IommuType `json:"iommu,omitempty"`
+	ID    string    `json:"id,omitempty"`
+}
+
+// PciDeviceInfo is the 200-OK response body of a hot (VM already running)
+// vm.add-device call: BDF is the device's address inside the guest (e.g.
+// "0000:00:08.0"), distinct from the host-side BDF in DeviceConfig.Path.
+type PciDeviceInfo struct {
+	ID  string `json:"id"`
+	BDF string `json:"bdf"`
+}
+
+// AddDevice hot-attaches a VFIO device (identified by its host sysfs path)
+// to the running guest. On a hot add (VM already running), cloud-hypervisor
+// returns 200 with a PciDeviceInfo naming the guest-side BDF; on a cold add
+// (VM not yet booted) it returns 204 with no body, in which case the
+// returned PciDeviceInfo is zero and BDF cannot be known until the guest
+// boots and the guest OS enumerates its PCI bus.
+func (c *Client) AddDevice(ctx context.Context, cfg DeviceConfig) (PciDeviceInfo, error) {
+	var info PciDeviceInfo
+	hadBody, err := c.putJSON(ctx, "/api/v1/vm.add-device", cfg, &info)
+	if err != nil {
+		return PciDeviceInfo{}, err
+	}
+	if !hadBody {
+		return PciDeviceInfo{}, nil
+	}
+	return info, nil
+}
+
+// RemoveDevice hot-detaches the device previously added under id (the ID
+// given to AddDevice, or the one it returned if none was given).
+func (c *Client) RemoveDevice(ctx context.Context, id string) error {
+	_, err := c.putJSON(ctx, "/api/v1/vm.remove-device", struct {
+		ID string `json:"id"`
+	}{ID: id}, nil)
+	return err
+}
+
+// getJSON issues a GET and decodes the 2xx JSON response into out.
+func (c *Client) getJSON(ctx context.Context, path string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiBase+path, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("GET %s: status %d: %s", path, resp.StatusCode, bytes.TrimSpace(b))
+	}
+	return json.Unmarshal(b, out)
+}
+
+// putJSON issues a PUT with a JSON body and, on a 200 with a non-empty body,
+// decodes it into out (hadBody reports whether that happened; a 204 or an
+// empty 200 body leaves out untouched and returns hadBody=false). out may be
+// nil if the caller doesn't need the response body at all.
+func (c *Client) putJSON(ctx context.Context, path string, body, out any) (hadBody bool, err error) {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return false, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, apiBase+path, bytes.NewReader(b))
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, err
+	}
+	if resp.StatusCode >= 300 {
+		return false, fmt.Errorf("PUT %s: status %d: %s", path, resp.StatusCode, bytes.TrimSpace(respBody))
+	}
+	if out == nil || len(bytes.TrimSpace(respBody)) == 0 {
+		return false, nil
+	}
+	if err := json.Unmarshal(respBody, out); err != nil {
+		return false, fmt.Errorf("PUT %s: decoding response: %w", path, err)
+	}
+	return true, nil
+}
