@@ -1,0 +1,40 @@
+# A real Agent Substrate ActorTemplate (protojson-shaped ateapi.ActorTemplate),
+# modeled directly on demos/counter/counter-template.yaml.tmpl, reusing the
+# identical counter actor app -- GNWES is only exercising pod-level admission
+# gating here, not different actor logic, so there's no reason to invent a new
+# actor. workerSelector picks gnwes-counter-workerpool.yaml.tmpl's WorkerPool
+# by its metadata.labels (not its pod-template labels -- see that file).
+#
+# Not a Kubernetes CRD: create with
+#   kubectl ate create actor-template -f gnwes-counter-template.yaml.tmpl
+# after resolving the ko:// image reference, same as upstream's own demo
+# deploy path (see cmd/ate-setup's demo-image resolution).
+metadata:
+  atespace: ate-demo-counter
+  name: gnwes-counter
+workerSelector:
+  matchLabels:
+    workload: gnwes-counter
+containers:
+- name: counter
+  image: ko://go.ate.dev/substrate/demos/counter
+  command:
+  - /ko-app/counter
+  - --extra-port=9090
+  - --tcp-port=9091
+  wakeupProbe:
+    httpGet:
+      path: /readyz
+      port: 80
+  volumeMounts:
+  - name: data
+    mountPath: /home/counter
+resources:
+  limits:
+    cpuMillicores: 1000
+    memoryBytes: 536870912 # 512Mi
+snapshotConfig:
+  preferredFidelity: SNAPSHOT_FIDELITY_MEMORY
+volumes:
+- name: data
+  durableDir: {}

@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gnwes-podgate-webhook
+  namespace: ate-demo-counter
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gnwes-podgate-webhook
+  namespace: ate-demo-counter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gnwes-podgate-webhook
+  template:
+    metadata:
+      labels:
+        app: gnwes-podgate-webhook
+    spec:
+      serviceAccountName: gnwes-podgate-webhook
+      containers:
+      - name: webhook
+        image: localhost:5001/gnwes-podgate-webhook:latest
+        ports:
+        - containerPort: 8443
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8443
+            scheme: HTTPS
+          initialDelaySeconds: 1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gnwes-podgate-webhook
+  namespace: ate-demo-counter
+spec:
+  selector:
+    app: gnwes-podgate-webhook
+  ports:
+  - port: 443
+    targetPort: 8443
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: gnwes-podgate-webhook
+webhooks:
+- name: podgate.gnwes.io
+  admissionReviewVersions: ["v1"]
+  sideEffects: None
+  failurePolicy: Ignore
+  timeoutSeconds: 5
+  rules:
+  - apiGroups: [""]
+    apiVersions: ["v1"]
+    resources: ["pods"]
+    operations: ["CREATE"]
+  objectSelector:
+    matchExpressions:
+    - key: gnwes.io/gpu-pool
+      operator: Exists
+  clientConfig:
+    service:
+      name: gnwes-podgate-webhook
+      namespace: ate-demo-counter
+      path: /mutate
+      port: 443
+    caBundle: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUNOekNDQWQ2Z0F3SUJBZ0lRU1BVT3RCS3psd2lyZTFEeFpoTVAzakFLQmdncWhrak9QUVFEQWpBMU1UTXcKTVFZRFZRUURFeXBuYm5kbGN5MXdiMlJuWVhSbExYZGxZbWh2YjJzdVlYUmxMV1JsYlc4dFkyOTFiblJsY2k1egpkbU13SGhjTk1qWXhNVEV3TVRnek9UVXlXaGNOTWpjeE1URXdNVGt6T1RVeVdqQTFNVE13TVFZRFZRUURFeXBuCmJuZGxjeTF3YjJSbllYUmxMWGRsWW1odmIyc3VZWFJsTFdSbGJXOHRZMjkxYm5SbGNpNXpkbU13V1RBVEJnY3EKaGtqT1BRSUJCZ2dxaGtqT1BRTUJCd05DQUFRNWdWRUc3eDdsdDdGMnc4cVFkaHRhbVZ3ZlVRNmVsR3NXekptRwpwN05hSWtZckh0eUQrVUtWQysyZFRvQTBOdmZnYU1TTlBpdUdGWllNaUpmeGRjOWtvNEhQTUlITU1BNEdBMVVkCkR3RUIvd1FFQXdJQ2hEQVRCZ05WSFNVRUREQUtCZ2dyQmdFRkJRY0RBVEFQQmdOVkhSTUJBZjhFQlRBREFRSC8KTUIwR0ExVWREZ1FXQkJTV1FFdHkvNkwwTW5WdTRnRmRxRVFZemFoQ3FEQjFCZ05WSFJFRWJqQnNnaXBuYm5kbApjeTF3YjJSbllYUmxMWGRsWW1odmIyc3VZWFJsTFdSbGJXOHRZMjkxYm5SbGNpNXpkbU9DT0dkdWQyVnpMWEJ2ClpHZGhkR1V0ZDJWaWFHOXZheTVoZEdVdFpHVnRieTFqYjNWdWRHVnlMbk4yWXk1amJIVnpkR1Z5TG14dlkyRnMKaHdSL0FBQUJNQW9HQ0NxR1NNNDlCQU1DQTBjQU1FUUNJRTI0QTZ5U3hVM2hVa3ozVUVsdGYyUjJ3ZUp5YytZZQpnVXFlTXBtZk9QVzZBaUJKcENVSGZXQmJOTVB0L0hJUlk5SHpyNTcxSFFOVGtrMHJ0Z1dybWVGVHVRPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=

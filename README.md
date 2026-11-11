@@ -40,10 +40,24 @@ is and isn't simulated and why.
     annotates the target pod with `gnwes.io/gpu-slot`; and releases the slot
     back to the pool on delete or TTL expiry (via a finalizer, so cleanup
     always runs).
-- **`cmd/manager`** — runs both controllers against whatever cluster your
-  kubeconfig points at (no in-cluster Deployment needed for this demo).
+- **`cmd/manager`** — runs all three controllers against whatever cluster
+  your kubeconfig points at (no in-cluster Deployment needed for this demo).
 - **`cmd/demo`** — the demo driver: cycles ephemeral actor pods through
   leases and prints attach-latency numbers, in `warm`, `cold`, or `both` mode.
+- **`cmd/podgate-webhook`** + **`config/webhook`** — a mutating admission
+  webhook that injects the `gnwes.io/gpu-capacity` scheduling gate onto any
+  pod labeled `gnwes.io/gpu-pool`. Needed to gate pods GNWES doesn't create
+  itself — see the Substrate integration below.
+
+## Real Agent Substrate integration
+
+This isn't just a standalone simulation anymore: **`config/substrate-integration`**
+documents a verified, real integration with the upstream
+[agent-substrate/substrate](https://github.com/agent-substrate/substrate)
+project — GNWES gating and leasing a genuine Substrate `WorkerPool` pod, with
+a real Substrate actor repeatedly resuming onto that exact, GPU-attached pod.
+Read that directory's `README.md` for what's proven, what's still simulated,
+and how to reproduce it.
 
 ## Quickstart
 

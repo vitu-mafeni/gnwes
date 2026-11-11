@@ -1,0 +1,14 @@
+# GNWES's own GPUWorkerPool CR for the Substrate integration demo. Must be
+# created in the same namespace the target WorkerPool's pods land in
+# (ate-demo-counter), because PodGateReconciler looks up pools by
+# "<pod namespace>/<gnwes.io/gpu-pool value>".
+apiVersion: gnwes.io/v1alpha1
+kind: GPUWorkerPool
+metadata:
+  name: gnwes-counter-pool
+  namespace: ate-demo-counter
+spec:
+  poolSize: 1
+  gpuModel: A100-mock-40GB
+  slotInitMillis: 4000
+  attachLatencyMillis: 150

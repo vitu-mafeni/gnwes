@@ -1,0 +1,40 @@
+# A real Agent Substrate WorkerPool (apiVersion ate.dev/v1), modeled directly
+# on agent-substrate/substrate's own demos/counter/counter.yaml.tmpl, with one
+# addition: spec.template.labels carries gnwes.io/gpu-pool. That label is what
+# GNWES's podgate-webhook (../webhook/podgate-webhook.yaml) matches on to add
+# the gnwes.io/gpu-capacity scheduling gate to every pod this WorkerPool's
+# Deployment creates — Substrate's WorkerPool API has no scheduling-gates
+# field of its own, so the gate has to be injected this way, from outside,
+# with zero changes to Substrate's source.
+#
+# metadata.labels (workload: gnwes-counter) is a SEPARATE thing: it's what an
+# ActorTemplate's workerSelector.matchLabels selects against to choose this
+# pool. Don't confuse it with spec.template.labels above, which is what
+# actually lands on the generated pods.
+#
+# workerImage uses a ko:// reference exactly like upstream's own templates;
+# resolve it the same way demos/counter does (ko resolve / ate-setup's own
+# demo-image resolution) before applying — do not hardcode a resolved
+# sha256 digest here, that ties this file to one local registry's state.
+apiVersion: ate.dev/v1
+kind: WorkerPool
+metadata:
+  name: gnwes-counter
+  namespace: ate-demo-counter
+  labels:
+    workload: gnwes-counter
+spec:
+  replicas: 1
+  workerImage: ko://go.ate.dev/substrate/cmd/ateworker-gvisor
+  sandboxClasses:
+  - name: gvisor
+  template:
+    labels:
+      gnwes.io/gpu-pool: gnwes-counter-pool
+    resources:
+      limits:
+        cpu: "1"
+        memory: 1Gi
+      requests:
+        cpu: 250m
+        memory: 1Gi
