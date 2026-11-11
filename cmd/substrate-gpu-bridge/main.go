@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
@@ -68,11 +67,11 @@ func main() {
 		log.Fatalf("building Kubernetes client: %v", err)
 	}
 
-	fetcher := &kubectlAteFetcher{
-		binary:     *kubectlAteBin,
-		atespace:   *atespace,
-		actorName:  *actorName,
-		kubeconfig: *kubectlAteKubeconfig,
+	fetcher := &substratebridge.KubectlAteFetcher{
+		Binary:     *kubectlAteBin,
+		Atespace:   *atespace,
+		ActorName:  *actorName,
+		Kubeconfig: *kubectlAteKubeconfig,
 	}
 	driver := &k8sAttachmentDriver{
 		client:    c,
@@ -96,38 +95,6 @@ func main() {
 	)
 
 	log.Println("substrate-gpu-bridge shutting down")
-}
-
-// kubectlAteFetcher implements substratebridge.ActorStateFetcher by
-// shelling out to kubectl-ate, the same tool and invocation pattern
-// config/substrate-integration already established for this repo (rather
-// than importing agent-substrate's internal Go packages across module
-// boundaries). kubectl-ate does not build natively on Windows
-// (internal/imagecache uses syscall.Stat_t) -- see RUNBOOK.md's Tier 3
-// section for the cross-compiled-binary-in-a-throwaway-container pattern
-// already worked out for exactly this reason.
-type kubectlAteFetcher struct {
-	binary     string
-	atespace   string
-	actorName  string
-	kubeconfig string
-}
-
-func (f *kubectlAteFetcher) FetchActorState(ctx context.Context) (string, error) {
-	args := []string{"get", "actor", f.actorName, "--atespace", f.atespace, "-o", "json"}
-	if f.kubeconfig != "" {
-		args = append([]string{"--kubeconfig", f.kubeconfig}, args...)
-	}
-
-	cmd := exec.CommandContext(ctx, f.binary, args...)
-	out, err := cmd.Output()
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("%s %v: %w (stderr: %s)", f.binary, args, err, string(ee.Stderr))
-		}
-		return "", fmt.Errorf("running %s %v: %w", f.binary, args, err)
-	}
-	return substratebridge.ParseActorState(out)
 }
 
 // k8sAttachmentDriver implements substratebridge.AttachmentDriver against a
