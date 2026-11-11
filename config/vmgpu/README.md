@@ -94,6 +94,22 @@ substrate-gpu-bridge \
   without guessing, and a `Run`-loop test drives a fake actor through
   `SUSPENDED → RUNNING → SUSPENDED` and confirms exactly the two real
   transitions land, in order. See `internal/substratebridge/bridge_test.go`.
+- **The real `kubectl-ate` against the real Substrate control plane,
+  driving a real `VMGPUAttachment`, live.** Ran the real
+  `cmd/substrate-gpu-bridge` binary against the real cross-compiled
+  `kubectl-ate-linux` (wrapped in a throwaway container on the `kind`
+  docker network, same pattern `config/substrate-integration` already
+  established — not `cmd/fakekubectlate` this time), pointed at the actual
+  `gnwes-actor-1` actor from that integration's own `ate-demo-counter`
+  atespace, still running from an earlier session. Confirmed, with real
+  `kubectl-ate resume actor`/`suspend actor` commands, not a simulated
+  state file: resuming the real actor produced
+  `ACTOR_STATE_RUNNING -> desiredState Attached` in the bridge's log within
+  one 3s poll, and the real reconciler reached `status.phase=Attached` with
+  a real guest BDF 3ms later; suspending the real actor again produced the
+  matching `Detached` transition and release. This is the strongest
+  verification available in this environment — the only boundary still not
+  crossed is cloud-hypervisor itself (next item).
 
 ## What's NOT verified
 
@@ -101,26 +117,21 @@ substrate-gpu-bridge \
   This dev environment has no `/dev/kvm` (confirmed in
   `research/live-attach-poc/README.md`) — nested virtualization isn't
   available, so a real cloud-hypervisor VM couldn't be booted here at all.
-  Everything above the VMM boundary is real and tested; the VMM itself, in
-  every test run so far, is `cmd/fakevmm`, not cloud-hypervisor.
-- **No real `kubectl-ate` invocation, no real Substrate control plane.**
-  `cmd/substrate-gpu-bridge` has only ever been run against
-  `cmd/fakekubectlate`. The real `kubectl-ate get actor -o json` JSON shape
-  it parses was confirmed by reading `api/ateapi/v1/ateapi.proto` (the
-  `ActorStatus.state`/`ActorState` definitions) and
-  `cmd/kubectl-ate/internal/cmd/actor.go`/`printer.go` (protojson output,
-  confirming camelCase field names and full enum-name string values) in the
-  real `agent-substrate/substrate` clone directly — not guessed — but it's
-  a source read, not a test against the real binary and a real running
-  actor. Also unverified: whether `RESUMING`-attaches-earlier would be
-  worth doing for latency (see `DesiredStateForActorState`'s doc comment).
+  Everything above the VMM boundary is real and tested, now including a
+  real Substrate actor's real resume/suspend lifecycle; the VMM itself, in
+  every test run so far, is still `cmd/fakevmm`, not cloud-hypervisor.
 - **No real Substrate `ateworker-microvm` deployment exercised.** The
-  `config/substrate-integration` work so far used Substrate's gVisor
-  worker, not its microVM one. Wiring this against a real one needs a
-  machine with nested virtualization, standing that worker type up, and
-  confirming the guest's NVIDIA driver actually re-probes a hot-added PCI
-  device without a reboot (also unconfirmed — see
-  `research/live-attach-poc/README.md`'s "Next steps").
+  `config/substrate-integration` work so far (and the real-actor bridge
+  test above) used Substrate's gVisor worker, not its microVM one. Wiring
+  this against a real one needs a machine with nested virtualization,
+  standing that worker type up, and confirming the guest's NVIDIA driver
+  actually re-probes a hot-added PCI device without a reboot (also
+  unconfirmed — see `research/live-attach-poc/README.md`'s "Next steps").
+- **Whether attaching earlier (during `ACTOR_STATE_RESUMING`, rather than
+  waiting for fully `RUNNING`) would be worth doing for latency** is
+  unexplored — `DesiredStateForActorState`'s conservative mapping was a
+  deliberate choice given no real cloud-hypervisor to test the transitional
+  case against, not a settled answer.
 
 ## Testing without real hardware
 
@@ -189,6 +200,42 @@ kubectl get vmgpuattachment -n gnwes-vmgpu -o wide   # -> Detached again
 immediately re-attach whatever `cmd/manager` just detached on the next
 poll), then make sure the attachment is `Detached` before stopping
 `cmd/manager` — see Troubleshooting below.
+
+## Driving this from a real Substrate actor instead of a fake one
+
+With `config/substrate-integration`'s real control plane already up (its own
+README covers standing it up) and `cmd/substrate-gpu-bridge` pointed at a
+real `kubectl-ate`, this is the same picture above but for real. The one
+wrinkle: `kubectl-ate` doesn't build or run natively on this Windows dev box
+(`internal/imagecache` uses `syscall.Stat_t`), so `-kubectl-ate-bin` needs to
+point at something that runs the real cross-compiled `kubectl-ate-linux`
+inside a container on the `kind` docker network and forwards its own
+arguments straight through — the same pattern `config/substrate-integration/README.md`
+already uses for `resume actor`/`suspend actor` by hand, just wrapped so
+`cmd/substrate-gpu-bridge`'s `exec.Command` can call it directly as one
+binary. A ~20-line Go program doing exactly that (build `docker run --rm
+--network kind -v <bin dir>:/bin2 -w /bin2 debian:bookworm-slim
+./kubectl-ate-linux --kubeconfig kubeconfig-internal.yaml <args...>` and run
+it) is enough; it's not checked into this repo since the mount path is
+specific to wherever your `agent-substrate` checkout's `bin/` lives.
+
+```bash
+substrate-gpu-bridge \
+  -kubectl-ate-bin /path/to/your/kubectl-ate-docker-wrapper \
+  -atespace ate-demo-counter -actor gnwes-actor-1 \
+  -attachment-namespace gnwes-vmgpu -attachment-name actor-worker-1-gpu \
+  -poll-interval 3s &
+
+# from another terminal, using the real kubectl-ate the same wrapper calls:
+kubectl-ate-docker-wrapper resume actor gnwes-actor-1 --atespace ate-demo-counter
+kubectl get vmgpuattachment -n gnwes-vmgpu -o wide   # -> Attached, driven by a REAL actor resume
+
+kubectl-ate-docker-wrapper suspend actor gnwes-actor-1 --atespace ate-demo-counter
+kubectl get vmgpuattachment -n gnwes-vmgpu -o wide   # -> Detached again
+```
+
+Confirmed exactly this sequence against this repo's own `gnwes-actor-1` —
+see "What's verified" above.
 
 ## Troubleshooting
 
