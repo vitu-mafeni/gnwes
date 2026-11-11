@@ -4,6 +4,10 @@ A runnable proof-of-concept of the core GNWES idea from the research docs:
 **lease a GPU by the second out of a pre-warmed pool, instead of provisioning
 one from scratch for every ephemeral agent.**
 
+**New to this repo? Start with [`RUNBOOK.md`](RUNBOOK.md)** — every command
+to run and test every part of this, organized fastest-first, each one
+actually run against a live cluster while writing it.
+
 This is a conference-demo build, not the full research design. The core
 headline flow — warm pool → sub-second lease attach → detach and reuse — runs
 anywhere `kind` + Docker, using a **simulated** GPU device (`cmd/manager` +
