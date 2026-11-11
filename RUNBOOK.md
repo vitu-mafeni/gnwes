@@ -313,6 +313,12 @@ otherwise its finalizer never gets removed and `kubectl delete namespace`
 hangs `Terminating` forever. See `config/vmgpu/README.md`'s Troubleshooting
 section for the fix if this happens anyway.
 
+**Driving this from an actual (or simulated) actor lifecycle instead of
+manual `kubectl patch`:** `cmd/substrate-gpu-bridge` polls one actor's state
+and flips `desiredState` for you — see `config/vmgpu/README.md`'s "The
+bridge" and "Testing the bridge too" sections for the real-`kubectl-ate` and
+`cmd/fakekubectlate`-stand-in walkthroughs respectively.
+
 ---
 
 ## 6. Concurrency / load test (the real one, not a unit test)

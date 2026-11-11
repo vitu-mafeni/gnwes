@@ -27,6 +27,29 @@ capability for a while.
 | Backing package | `internal/pool` | `internal/vfiopool` (same Acquire/Release race-safety property, proven the same way — see its own `TestConcurrentAcquireReleaseNeverDoubleBooks`) |
 | REST client | n/a | `internal/chclient`, wire format taken directly from cloud-hypervisor's own OpenAPI spec and `docs/hotplug.md`, not guessed |
 
+## The bridge: deciding WHEN to flip `desiredState`
+
+`internal/substratebridge` + `cmd/substrate-gpu-bridge` close the gap this
+README used to list under "No bridge to Substrate's actual actor lifecycle"
+(see git history if you want the exact old wording). It polls one actor's
+state via `kubectl-ate get actor -o json` (Substrate's `Actor` isn't a
+Kubernetes CRD — only `WorkerPool` is, confirmed by grepping the real
+`agent-substrate/substrate` clone for `kubebuilder:object:root` — so there's
+nothing to `kubectl get --watch` instead) and flips one `VMGPUAttachment`'s
+`spec.desiredState` to match: `Attached` while `ACTOR_STATE_RUNNING`,
+`Detached` for every other state (including the transitional
+`RESUMING`/`SUSPENDING` — see `DesiredStateForActorState`'s doc comment for
+why that's the conservative choice, not an oversight).
+
+```bash
+substrate-gpu-bridge \
+  -kubectl-ate-bin kubectl-ate \
+  -kubectl-ate-kubeconfig /path/to/substrate-control-plane-kubeconfig.yaml \
+  -atespace ate-demo-counter -actor gnwes-actor-1 \
+  -attachment-namespace gnwes-vmgpu -attachment-name actor-worker-1-gpu \
+  -poll-interval 1s
+```
+
 ## What's verified, and how
 
 - **`internal/chclient`** — verified against a *real* HTTP server listening
@@ -53,6 +76,24 @@ capability for a while.
   released the device back to the pool (confirmed via the pool's own status
   immediately reflecting `availableDevices` again once the `VFIOGPUPool`
   object was re-reconciled).
+- **The bridge, end-to-end, live** — same `kind-kind` cluster, same real
+  `cmd/manager`/`cmd/fakevmm`, plus **`cmd/fakekubectlate`** (a stand-in for
+  `kubectl-ate get actor -o json` driven by a plain text file, so a test can
+  flip the "actor's" state without a real Substrate control plane) and the
+  real `cmd/substrate-gpu-bridge` binary polling it. Confirmed: writing
+  `ACTOR_STATE_RUNNING` to the state file produced a real `desiredState`
+  patch within one poll interval, which the real reconciler then turned
+  into a real `vm.add-device` call and `status.phase=Attached`; writing
+  `ACTOR_STATE_SUSPENDED` reversed both steps. The bridge's own log showed
+  exactly two transitions, matching the two writes, with no spurious
+  extra patches in between polls where nothing had changed.
+- **`internal/substratebridge`'s decision logic itself** — unit-tested with
+  fakes for both the actor-state fetcher and the attachment driver: applies
+  a change only when the computed desired state differs from the current
+  one (no needless API writes once settled), propagates fetch/write errors
+  without guessing, and a `Run`-loop test drives a fake actor through
+  `SUSPENDED → RUNNING → SUSPENDED` and confirms exactly the two real
+  transitions land, in order. See `internal/substratebridge/bridge_test.go`.
 
 ## What's NOT verified
 
@@ -62,14 +103,17 @@ capability for a while.
   available, so a real cloud-hypervisor VM couldn't be booted here at all.
   Everything above the VMM boundary is real and tested; the VMM itself, in
   every test run so far, is `cmd/fakevmm`, not cloud-hypervisor.
-- **No bridge to Substrate's actual actor lifecycle.** Flipping
-  `spec.desiredState` is what a bridge watching Substrate actor resume/
-  suspend transitions (e.g. polling `kubectl-ate get actor -o json`, since
-  Substrate's `Actor`/`WorkerAssignment` aren't Kubernetes CRDs you can
-  `kubectl get` or watch directly — only `WorkerPool` is) would do. That
-  bridge is not built. This mechanism is the real, working "how do I
-  actually hot-attach a device" half; "when do I decide to" is still a
-  manual `kubectl patch` or a future, separate component.
+- **No real `kubectl-ate` invocation, no real Substrate control plane.**
+  `cmd/substrate-gpu-bridge` has only ever been run against
+  `cmd/fakekubectlate`. The real `kubectl-ate get actor -o json` JSON shape
+  it parses was confirmed by reading `api/ateapi/v1/ateapi.proto` (the
+  `ActorStatus.state`/`ActorState` definitions) and
+  `cmd/kubectl-ate/internal/cmd/actor.go`/`printer.go` (protojson output,
+  confirming camelCase field names and full enum-name string values) in the
+  real `agent-substrate/substrate` clone directly — not guessed — but it's
+  a source read, not a test against the real binary and a real running
+  actor. Also unverified: whether `RESUMING`-attaches-earlier would be
+  worth doing for latency (see `DesiredStateForActorState`'s doc comment).
 - **No real Substrate `ateworker-microvm` deployment exercised.** The
   `config/substrate-integration` work so far used Substrate's gVisor
   worker, not its microVM one. Wiring this against a real one needs a
@@ -113,6 +157,38 @@ different code-wise: set `apiSocket` to that VMM's real api-socket path
 (e.g. Kata's `/run/vc/vm/<id>/clh-api.sock`) instead of `fakevmm`'s. That
 path has simply not been exercised yet in this repo (see "What's NOT
 verified" above).
+
+**Testing the bridge too, without a real Substrate control plane:** add
+`cmd/fakekubectlate` as a stand-in for `kubectl-ate` on top of the setup
+above (same cluster, same `fakevmm`, `VMGPUAttachment.spec.desiredState`
+can start at either value since the bridge will correct it within one poll):
+
+```bash
+go build -o fakekubectlate ./cmd/fakekubectlate
+go build -o substrate-gpu-bridge ./cmd/substrate-gpu-bridge
+
+echo -n "ACTOR_STATE_SUSPENDED" > actor-state.txt
+FAKE_ACTOR_STATE_FILE="$(pwd)/actor-state.txt" ./substrate-gpu-bridge \
+  -kubectl-ate-bin ./fakekubectlate \
+  -atespace fake-atespace -actor fake-actor \
+  -attachment-namespace gnwes-vmgpu -attachment-name actor-worker-1-gpu \
+  -poll-interval 1s &
+
+kubectl get vmgpuattachment -n gnwes-vmgpu -o wide   # Detached
+
+echo -n "ACTOR_STATE_RUNNING" > actor-state.txt
+sleep 2
+kubectl get vmgpuattachment -n gnwes-vmgpu -o wide   # -> Attached, for real
+
+echo -n "ACTOR_STATE_SUSPENDED" > actor-state.txt
+sleep 2
+kubectl get vmgpuattachment -n gnwes-vmgpu -o wide   # -> Detached again
+```
+
+**Cleanup order matters here too:** stop the bridge first (it'll otherwise
+immediately re-attach whatever `cmd/manager` just detached on the next
+poll), then make sure the attachment is `Detached` before stopping
+`cmd/manager` — see Troubleshooting below.
 
 ## Troubleshooting
 

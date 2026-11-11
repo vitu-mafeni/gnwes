@@ -57,6 +57,12 @@ research docs are still out of scope for this build.
   `vm.remove-device`), wire format taken from cloud-hypervisor's own OpenAPI
   spec, not guessed. `cmd/fakevmm` is a stand-in VMM for testing this
   without real cloud-hypervisor/KVM hardware available.
+- **`internal/substratebridge`** + **`cmd/substrate-gpu-bridge`** — decides
+  *when* to flip a `VMGPUAttachment`'s `desiredState`, by polling one Agent
+  Substrate actor's lifecycle state (`kubectl-ate get actor -o json`) and
+  mapping `ACTOR_STATE_RUNNING` to `Attached`, everything else to
+  `Detached`. `cmd/fakekubectlate` is a stand-in for `kubectl-ate` for
+  testing this without a real Substrate control plane running.
 - **`internal/controller`** — five reconcilers:
   - `GPUWorkerPoolReconciler` grows/shrinks the pool toward `spec.poolSize`
     and reports `Warming`/`Ready` status.
@@ -153,8 +159,12 @@ whole mechanism is verified live against a real Kubernetes cluster; the VMM
 itself, in every run so far, is a local stand-in
 (`cmd/fakevmm`), not a real cloud-hypervisor+KVM instance or a real
 Substrate `ateworker-microvm` deployment — this dev environment has neither
-available. See `config/vmgpu/README.md` for exactly what that does and
-doesn't prove.
+available. `internal/substratebridge` + `cmd/substrate-gpu-bridge` close the
+other half — polling one actor's state (`kubectl-ate get actor -o json`,
+since Substrate's `Actor` isn't a Kubernetes CRD) and flipping
+`VMGPUAttachment.spec.desiredState` to match, also verified live end-to-end
+with a stand-in for `kubectl-ate` (`cmd/fakekubectlate`). See
+`config/vmgpu/README.md` for exactly what that does and doesn't prove.
 
 ## Quickstart
 
