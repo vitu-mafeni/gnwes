@@ -23,6 +23,194 @@ needed.
 | 3 | The GPU attaches into the **agent's own sandbox**, not a side VM — the actual WorkerPool integration | Agent Substrate's microVM worker (Kata + Cloud Hypervisor) deployed |
 | Notebook | Same fast attach/detach, driven by a Jupyter kernel's busy/idle state instead of an actor's resume/suspend state | A new (unbuilt) `jupyter-gpu-bridge`, same shape as `substrate-gpu-bridge` |
 
+## Prerequisites and node configuration
+
+This is the clean, working recipe — not the debugging journey it took to find
+it (that's in `README.md`'s "What's verified" section and the commit history,
+for the historical record). Follow this start to finish on a fresh node and
+you should reach a working Cloud Hypervisor + real-GPU setup without hitting
+any of today's wedges.
+
+### Hardware/OS requirements
+
+- Bare metal (or a VM with nested virtualization already enabled) — this
+  mechanism needs real `/dev/kvm`. Confirmed working on Ubuntu 22.04.5 LTS,
+  kernel 5.15.0-186-generic, with real Intel VT-x.
+- At least one NVIDIA GPU you can dedicate to VFIO passthrough. **If the node
+  has multiple identical GPU models, you must use the boot-time exclusion
+  method below (not a live unbind) — see "Why boot-time, not live-unbind"**.
+- `sudo` access, and — if the node is shared/production — a quiet window or
+  explicit sign-off, since steps 2 and 4 below involve reboots.
+
+### 1. Confirm KVM is actually available
+
+```bash
+ls -l /dev/kvm
+lsmod | grep -i kvm
+```
+
+Expect `/dev/kvm` to exist and `kvm_intel` (or `kvm_amd`) to show as loaded.
+If `/dev/kvm` doesn't exist at all, this is either a VM without nested
+virtualization enabled, or a BIOS setting (VT-x/AMD-V) that needs enabling
+first — stop here until it does.
+
+### 2. Enable IOMMU, if it isn't already
+
+```bash
+cat /proc/cmdline   # look for intel_iommu=on or amd_iommu=on already present
+```
+
+If absent:
+
+```bash
+sudo cp /etc/default/grub /etc/default/grub.bak.$(date +%s)
+grep GRUB_CMDLINE_LINUX /etc/default/grub   # see what's there before changing it
+sudo sed -i -E 's/^(GRUB_CMDLINE_LINUX_DEFAULT=")([^"]*)(")$/\1\2 intel_iommu=on iommu=pt\3/' /etc/default/grub
+grep GRUB_CMDLINE_LINUX /etc/default/grub   # confirm it looks right BEFORE rebuilding
+sudo update-grub   # watch for errors; a missing-firmware warning for an
+                    # unrelated module (e.g. "ast") is harmless and expected
+sudo reboot
+```
+
+After reboot, confirm:
+
+```bash
+cat /proc/cmdline                               # should show intel_iommu=on iommu=pt
+dmesg | grep -i -e DMAR -e IOMMU | head -5       # expect "DMAR: IOMMU enabled"
+```
+
+### 3. Identify your target GPU's PCI functions and IOMMU group
+
+```bash
+lspci -Dnn | grep -i nvidia   # find your target GPU's base address, e.g. 0000:18:00.0
+
+# a consumer GPU typically has 4 functions (VGA/audio/USB/USB-C) that MUST
+# move to VFIO together -- they share one IOMMU group
+for d in /sys/bus/pci/devices/0000:18:00.*; do
+  echo "$d -> iommu group $(basename "$(readlink -f "$d/iommu_group")")"
+done
+ls /sys/kernel/iommu_groups/<group-number-from-above>/devices/
+```
+
+Confirm the group contains *only* your target GPU's own functions, nothing
+from another device you need to keep on the host.
+
+### 4. Reserve that GPU for VFIO at boot (not a live unbind)
+
+**Why boot-time, not live-unbind:** on an actively GPU-Operator-managed
+node, attempting `echo <dev> > .../driver/unbind` on an already-bound,
+already-in-use GPU reproducibly wedges — the process can survive even
+`kill -9` — because something (a GPU-sharing scheduler's device plugin, a
+DCGM/`nv-hostengine` monitoring daemon, possibly others never fully
+identified) holds the device open and NVIDIA's driver waits indefinitely for
+that handle to close. Chasing down every possible holder live is fragile and
+not guaranteed to ever find them all. The fix that actually worked: make the
+GPU belong to `vfio-pci` from the very start of boot, so `nvidia.ko` never
+gets a chance to claim it in the first place — there is then nothing to
+unbind, and nothing to race against.
+
+```bash
+sudo tee /etc/initramfs-tools/scripts/init-top/gnwes-vfio-gpu0.sh > /dev/null <<'HOOK'
+#!/bin/sh
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+  prereqs) prereqs; exit 0 ;;
+esac
+
+for dev in 0000:18:00.0 0000:18:00.1 0000:18:00.2 0000:18:00.3; do
+  if [ -e "/sys/bus/pci/devices/$dev" ]; then
+    echo vfio-pci > "/sys/bus/pci/devices/$dev/driver_override" 2>/dev/null
+    echo "$dev" > /sys/bus/pci/drivers_probe 2>/dev/null
+  fi
+done
+HOOK
+sudo chmod +x /etc/initramfs-tools/scripts/init-top/gnwes-vfio-gpu0.sh
+
+cat /etc/initramfs-tools/scripts/init-top/gnwes-vfio-gpu0.sh   # confirm it looks right
+sudo update-initramfs -u -k $(uname -r)   # watch for errors before rebooting
+sudo reboot
+```
+
+Replace the 4 PCI addresses with your target GPU's own (from step 3). This
+is **initramfs-tools** syntax (Debian/Ubuntu); a dracut-based distro needs
+the equivalent dracut module convention instead.
+
+After reboot, confirm:
+
+```bash
+for dev in 0000:18:00.0 0000:18:00.1 0000:18:00.2 0000:18:00.3; do
+  echo "$dev -> $(readlink -f /sys/bus/pci/devices/$dev/driver 2>/dev/null | xargs -r basename)"
+done
+nvidia-smi   # should now list one fewer GPU than before -- the reserved one is gone from the host's view
+```
+
+**This reservation is permanent across reboots** until the hook is removed
+and the initramfs rebuilt again — the GPU will not be visible to
+`nvidia-smi`, GPU Operator, or any GPU-sharing scheduler on this node until
+you revert it.
+
+### 5. Install Cloud Hypervisor, `ch-remote`, and boot firmware
+
+```bash
+mkdir -p ~/ch-test && cd ~/ch-test
+wget -q https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v54.1/cloud-hypervisor-static -O cloud-hypervisor
+wget -q https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v54.1/ch-remote-static -O ch-remote
+chmod +x cloud-hypervisor ch-remote
+./cloud-hypervisor --version
+
+wget -q https://github.com/cloud-hypervisor/rust-hypervisor-firmware/releases/download/0.4.2/hypervisor-fw
+sudo setcap cap_net_admin+ep ./cloud-hypervisor
+```
+
+### 6. Build a test guest image
+
+```bash
+sudo apt-get update -qq && sudo apt-get install -y -qq qemu-utils cloud-image-utils tmux
+wget -q https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img
+qemu-img convert -p -f qcow2 -O raw jammy-server-cloudimg-amd64.img jammy-server-cloudimg-amd64.raw
+qemu-img resize jammy-server-cloudimg-amd64.raw +4G
+
+cat > user-data <<'EOF'
+#cloud-config
+password: cloud123
+chpasswd: { expire: False }
+ssh_pwauth: True
+EOF
+cat > meta-data <<'EOF'
+instance-id: chtest01
+local-hostname: chtest
+EOF
+cloud-localds seed.img user-data meta-data
+```
+
+Jammy (22.04), not an older cloud image — its kernel (5.15+) is already past
+the "needs ACPI GED, 5.5-rc1 or later" requirement `docs/hotplug.md` states
+for PCI hotplug, without relying on an older kernel's config flag. **Login
+is the distro's default user (`ubuntu`), not a separate `cloud` user** — the
+cloud-config above only sets that user's password.
+
+### 7. Boot the test VM and confirm its REST API answers
+
+```bash
+tmux new-session -d -s chvm \
+  "sudo ./cloud-hypervisor \
+     --api-socket /tmp/ch-api.sock \
+     --firmware ./hypervisor-fw \
+     --disk path=jammy-server-cloudimg-amd64.raw,image_type=raw path=seed.img,image_type=raw \
+     --cpus boot=2 \
+     --memory size=2048M \
+     --serial tty --console off"
+sleep 5
+sudo ./ch-remote --api-socket=/tmp/ch-api.sock info
+```
+
+Expect a JSON config with `"state":"Running"`. If you instead get
+`Connection refused`, the VM didn't start — check
+`tmux capture-pane -t chvm -p` for the actual boot error before continuing.
+
+At this point the node matches exactly the state Phase 0/1 below assume.
+
 ## Phase 0 — getting gnwes onto `dcn-gpu-0`
 
 Everything from here on needs `cmd/manager`, `cmd/substrate-gpu-bridge`, or
