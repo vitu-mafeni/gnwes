@@ -145,6 +145,83 @@ genuine `ResourceClaim` allocation, followed by `nvidia-smi` inside the test
 pod showing exactly the one physical GPU that claim was allocated, not the
 node's other GPUs.
 
+### Tested recipe: a GPU Operator + CRI-O node (e.g. dcn-gpu-0)
+
+This exact sequence is the one that worked, live, on real hardware. If your
+GPU node also runs NVIDIA GPU Operator with CDI enabled, this should work
+as-is; otherwise see the prerequisites checks first.
+
+**0. One-time discovery, if you haven't confirmed this node's setup before**
+(run on the GPU node itself over SSH):
+
+```bash
+nvidia-smi
+```
+```bash
+kubectl get clusterpolicy -o yaml | grep -i -B2 -A2 cdi   # want: enabled: true
+```
+```bash
+ls -la /var/run/cdi   # want a file like k8s.device-plugin.nvidia.com-gpu.json
+```
+```bash
+cat /var/run/cdi/k8s.device-plugin.nvidia.com-gpu.json | grep -o '"kind":"[^"]*"' | head -1
+```
+
+If that file exists and its `kind` is `k8s.device-plugin.nvidia.com/gpu`
+(GPU Operator's default), `driver-real-gpu.yaml`'s defaults need no changes.
+If the filename or kind differs, override `NVIDIA_CDI_EXISTING_SPEC` /
+`NVIDIA_CDI_KIND` in that file's env vars to match.
+
+**1. Build and get the driver image onto the node** (pick one):
+
+```bash
+# A) Build directly on the GPU node with Podman/Docker (simplest, no registry):
+sudo podman build --target real-gpu -t localhost/gnwes-mock-gpu-driver:real-gpu -f cmd/mock-gpu-driver/Dockerfile .
+```
+```bash
+# B) Or push to a registry your cluster can already pull from (e.g. an
+# in-cluster Harbor), then point driver-real-gpu.yaml's `image:` field at it:
+docker build --target real-gpu -t <your-registry>/gnwes-mock-gpu-driver:real-gpu -f cmd/mock-gpu-driver/Dockerfile .
+docker push <your-registry>/gnwes-mock-gpu-driver:real-gpu
+```
+
+**2. Deploy** (from a node with `kubectl` access, e.g. the control plane):
+
+```bash
+kubectl apply -f config/dra/deviceclass.yaml
+kubectl apply -f config/dra/driver-real-gpu.yaml
+kubectl apply -f config/dra/resourceclaimtemplate.yaml
+kubectl apply -f config/dra/test-pod-real-gpu.yaml
+```
+
+**3. Verify** — this is the actual proof, not just that objects exist:
+
+```bash
+kubectl get resourceclaim -n gnwes-dra-demo -o wide        # want: allocated,reserved
+kubectl get pod gnwes-dra-test-real-gpu -n gnwes-dra-demo -w   # wait for Running
+kubectl exec gnwes-dra-test-real-gpu -n gnwes-dra-demo -- nvidia-smi
+```
+
+Expect `nvidia-smi` inside the pod to show **exactly one** GPU — the one the
+`ResourceClaim` was allocated (check its PCI Bus-Id against
+`kubectl describe resourceclaim -n gnwes-dra-demo`) — not every GPU on the
+node. That's real device isolation via a real DRA allocation, confirmed on
+this exact 3x TITAN RTX node.
+
+**4. Clean up** when done (this frees the GPU back up — do this on any
+shared/production cluster rather than leaving the test pod running):
+
+```bash
+kubectl delete -f config/dra/test-pod-real-gpu.yaml
+kubectl delete -f config/dra/driver-real-gpu.yaml
+```
+
+(`driver-real-gpu.yaml` owns the `gnwes-dra-demo` Namespace, so deleting it
+tears down the ServiceAccount/RBAC/DaemonSet together. The `DeviceClass`
+from step 2 is cluster-scoped and harmless to leave; `kubectl delete -f
+config/dra/deviceclass.yaml` removes it too if you want a fully clean
+slate.)
+
 ---
 
 ## 4. Tier 3 — real Agent Substrate integration
