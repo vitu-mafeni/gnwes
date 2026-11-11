@@ -1,0 +1,20 @@
+# Minimal pod that actually consumes a real DRA-allocated device, to prove
+# the full mechanism end to end (see config/dra/README.md for how to verify).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gnwes-dra-test
+  namespace: gnwes-dra-demo
+spec:
+  resourceClaims:
+  - name: gpu
+    resourceClaimTemplateName: gnwes-mock-gpu
+  containers:
+  - name: test
+    # busybox, not pause: we need a shell to `kubectl exec ... -- env` and
+    # actually observe the CDI-injected env var inside the running container.
+    image: busybox:stable
+    command: ["sleep", "infinity"]
+    resources:
+      claims:
+      - name: gpu

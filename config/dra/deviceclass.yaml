@@ -1,0 +1,8 @@
+# A real resource.k8s.io/v1 DeviceClass. No selector is set: this cluster has
+# only one DRA driver (mock-gpu.gnwes.io), so an empty selector list already
+# scopes claims to it correctly. A multi-driver cluster would add a CEL
+# selector matching e.g. device.driver == "mock-gpu.gnwes.io".
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: gnwes-mock-gpu
