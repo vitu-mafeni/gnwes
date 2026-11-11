@@ -250,6 +250,15 @@ onto the exact pod GNWES gated and attached. Suspend it again when you're
 done poking (`suspend actor` in place of `resume actor`), to leave things
 quiescent — don't delete it.
 
+**What this does and doesn't prove:** real gating/leasing against a real
+`WorkerPool`, real actor resume onto the exact pod — but the GPU attach step
+itself is still GNWES's sleep+annotation stand-in, not real CDI injection.
+That's not a shortcut unique to this demo: attaching a real device to a pod
+Substrate *reuses* across many actors (rather than creates fresh per actor)
+is an open problem upstream too — see `config/substrate-integration/README.md`
+and `config/dra/README.md` for the full explanation and the upstream issue
+this tracks against (`agent-substrate/substrate#752`).
+
 **Fresh setup:** follow `config/substrate-integration/README.md` in full —
 it covers cloning upstream, standing up `ate-system`, and deploying the
 `gnwes-counter` WorkerPool/ActorTemplate pair. Don't attempt it without

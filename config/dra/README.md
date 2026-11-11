@@ -42,8 +42,26 @@ settings onto the generated pod
 `NodeSelector`/`Tolerations`/`PriorityClassName`/`ServiceAccountName`/
 `NodeAffinity` — never `pod.spec.resourceClaims`. This build therefore proves
 the DRA+CDI mechanism against a plain GNWES-created test pod
-(`test-pod.yaml`), not a real Substrate worker pod. Whether and how to raise
-this with Substrate's maintainers is a separate decision, not made here.
+(`test-pod.yaml`), not a real Substrate worker pod.
+
+**This is a known, open gap upstream, not just something this build found.**
+Substrate's own Nov 2026 announcement
+([blog](https://developer.nvidia.com/blog/agent-substrate-advancing-kubernetes-for-agents-at-scale/))
+says plainly: "GPU support is being rebuilt on the new DRA foundation," and
+device pluggability via DRA is tracked only as an open design issue
+([#752](https://github.com/agent-substrate/substrate/issues/752)), not a
+merged PR. The deeper reason it's unsolved isn't the missing
+`resourceClaims` field — that's a small API gap, easy to add — it's that
+vanilla Kubernetes DRA resolves a `ResourceClaim` at pod *creation* time, full
+stop, while Substrate's whole model is reusing one already-running worker pod
+across many sequential actors (`WorkerPool` multiplexes actors onto a small,
+long-lived pool rather than creating a pod per actor). Wiring real DRA onto a
+`WorkerPool` pod template would get you a GPU attached once, at that pod's
+creation — not attached/detached per actor turn, which is what Substrate
+actually needs. That deeper mismatch is what this build leaves open, same as
+upstream's own roadmap. See `config/substrate-integration/README.md` for
+exactly how far GNWES's own gating/leasing goes against a real `WorkerPool`
+today, and what it still doesn't attempt.
 
 ## Running on real GPU nodes
 

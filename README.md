@@ -96,13 +96,28 @@ one, so unit tests here run without it — CI's Linux runners do have one, so
 
 ## Real Agent Substrate integration
 
-This isn't just a standalone simulation anymore: **`config/substrate-integration`**
-documents a verified, real integration with the upstream
-[agent-substrate/substrate](https://github.com/agent-substrate/substrate)
+**`config/substrate-integration`** documents a verified, real integration with
+the upstream [agent-substrate/substrate](https://github.com/agent-substrate/substrate)
 project — GNWES gating and leasing a genuine Substrate `WorkerPool` pod, with
-a real Substrate actor repeatedly resuming onto that exact, GPU-attached pod.
-Read that directory's `README.md` for what's proven, what's still simulated,
-and how to reproduce it.
+a real Substrate actor repeatedly resuming onto that exact pod. Read that
+directory's `README.md` for what's proven, what's still simulated, and how to
+reproduce it.
+
+**What this does *not* claim**: it does not attach a real GPU to that pod
+across the resumes — the attach step there is still GNWES's own stand-in
+(sleep + annotation), same as the base demo. Doing that for real would mean
+attaching/detaching a device on a worker pod that Substrate *reuses* across
+many sequential actors, rather than one created fresh per workload — and
+that's not a GNWES shortcut, it's an open problem upstream too: Substrate's
+own Nov 2026 announcement states GPU support "is being rebuilt" on Kubernetes
+DRA and is tracked as an open design issue
+([agent-substrate/substrate#752](https://github.com/agent-substrate/substrate/issues/752)),
+with GPU suspend/resume across actors described only as "a design" they
+propose, not something shipped. `config/dra` (below) proves the real DRA+CDI
+mechanism works end-to-end on real hardware, but only for a device bound at
+pod-creation time — the vanilla K8s DRA model. Bridging that to Substrate's
+reuse-the-same-pod model is the genuine, still-open piece of work, not a
+detail either project has already solved.
 
 ## Quickstart
 

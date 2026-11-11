@@ -54,7 +54,16 @@ generic; only the webhook is Substrate-specific.
   into Substrate's actual resume path would mean touching
   `cmd/ateworker-gvisor/runsc.go`'s `writeSpec` — genuinely Substrate source,
   and genuinely not done here, by us or upstream. That remains the real open
-  problem to present, not something quietly worked around.
+  problem to present, not something quietly worked around. It's also not a
+  gap unique to this demo: Substrate's own Nov 2026 announcement says GPU
+  support "is being rebuilt" on Kubernetes DRA, tracked only as an open
+  design issue ([#752](https://github.com/agent-substrate/substrate/issues/752)),
+  with GPU suspend/resume across actor turns described as a proposed design,
+  not shipped code. `config/dra` proves the DRA+CDI mechanism itself works on
+  real hardware — but only for a device bound once, at pod-creation time.
+  Hooking that into a worker pod Substrate *reuses* across many actors (this
+  integration's actual subject) is the piece neither GNWES nor upstream has
+  solved yet.
 - **Gating is per-pod, not per-activation.** A worker pod hosts one actor at
   a time but can serve many different actors sequentially across its life
   (suspend one, resume another). GNWES's Kubernetes-level scheduling gate
