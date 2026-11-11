@@ -1,0 +1,146 @@
+# Same DRA driver as driver.yaml, but running the REAL backend
+# (GNWES_GPU_BACKEND=nvidia) against actual NVIDIA hardware instead of the
+# mock backend. Read "Running on real GPU nodes" in README.md before
+# applying this -- the mounts below assume the most common bare-metal layout
+# (NVIDIA driver + nvidia-container-toolkit installed directly on the host
+# via `apt install nvidia-driver-XXX nvidia-container-toolkit`), which this
+# project has not had real hardware to verify against; see the README for
+# what to check and adjust for your specific nodes.
+#
+# Run this OR driver.yaml per node, never both: each registers a DRA driver
+# named mock-gpu.gnwes.io, and two instances would both try to manage the
+# same node's devices.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gnwes-dra-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gnwes-mock-gpu-driver
+  namespace: gnwes-dra-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gnwes-mock-gpu-driver
+rules:
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceclaims"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceslices"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gnwes-mock-gpu-driver
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gnwes-mock-gpu-driver
+subjects:
+- kind: ServiceAccount
+  name: gnwes-mock-gpu-driver
+  namespace: gnwes-dra-demo
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gnwes-mock-gpu-driver-real
+  namespace: gnwes-dra-demo
+spec:
+  selector:
+    matchLabels:
+      app: gnwes-mock-gpu-driver-real
+  template:
+    metadata:
+      labels:
+        app: gnwes-mock-gpu-driver-real
+    spec:
+      serviceAccountName: gnwes-mock-gpu-driver
+      priorityClassName: system-node-critical
+      # Adjust to however your cluster labels real GPU nodes. NVIDIA GPU
+      # Operator / GPU Feature Discovery sets nvidia.com/gpu.present=true;
+      # on a hand-built cluster you may need to label nodes yourself first:
+      #   kubectl label node <gpu-node> nvidia.com/gpu.present=true
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      containers:
+      - name: driver
+        image: localhost:5001/gnwes-mock-gpu-driver:real-gpu
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: GNWES_GPU_BACKEND
+          value: "nvidia"
+        - name: LD_LIBRARY_PATH
+          value: "/usr/lib/x86_64-linux-gnu"
+        securityContext:
+          privileged: true # same rationale as driver.yaml: simplest way to
+            # get write access to the host kubelet plugin/registry and CDI
+            # directories, plus read access to the host's NVIDIA tools/libs
+            # below. A real driver would scope this down to exactly the
+            # mounts it needs.
+        volumeMounts:
+        - name: plugins-registry
+          mountPath: /var/lib/kubelet/plugins_registry
+        - name: plugins
+          mountPath: /var/lib/kubelet/plugins
+        - name: cdi-etc
+          mountPath: /etc/cdi
+        - name: cdi-run
+          mountPath: /var/run/cdi
+        # The host's real NVIDIA tools and driver libraries. This layout
+        # matches a standard bare-metal install. If your cluster instead
+        # runs NVIDIA GPU Operator (which stages the driver inside a
+        # container, not directly on the host), replace these three mounts
+        # with one pointing at its driver root instead -- typically:
+        #   hostPath: /run/nvidia/driver
+        # and point NVIDIA_SMI_PATH / NVIDIA_CTK_PATH / LD_LIBRARY_PATH at
+        # that root's usr/bin and usr/lib/x86_64-linux-gnu subdirectories.
+        - name: nvidia-smi-bin
+          mountPath: /usr/bin/nvidia-smi
+          readOnly: true
+        - name: nvidia-ctk-bin
+          mountPath: /usr/bin/nvidia-ctk
+          readOnly: true
+        - name: nvidia-driver-libs
+          mountPath: /usr/lib/x86_64-linux-gnu
+          readOnly: true
+      volumes:
+      - name: plugins-registry
+        hostPath:
+          path: /var/lib/kubelet/plugins_registry
+          type: Directory
+      - name: plugins
+        hostPath:
+          path: /var/lib/kubelet/plugins
+          type: Directory
+      - name: cdi-etc
+        hostPath:
+          path: /etc/cdi
+          type: DirectoryOrCreate
+      - name: cdi-run
+        hostPath:
+          path: /var/run/cdi
+          type: DirectoryOrCreate
+      - name: nvidia-smi-bin
+        hostPath:
+          path: /usr/bin/nvidia-smi
+          type: File
+      - name: nvidia-ctk-bin
+        hostPath:
+          path: /usr/bin/nvidia-ctk
+          type: File
+      - name: nvidia-driver-libs
+        hostPath:
+          path: /usr/lib/x86_64-linux-gnu
+          type: Directory

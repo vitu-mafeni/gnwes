@@ -22,7 +22,11 @@ the container — verified by `kubectl exec`-ing into the running container and
 seeing the injection take effect. Only the device identity is mocked (no real
 NVIDIA hardware exists in this environment); everything else in that path —
 the API objects, the scheduling, the kubelet plugin protocol, the CDI
-file and its injection — is real. See `config/dra/README.md`.
+file and its injection — is real. `cmd/mock-gpu-driver` now also has a real
+NVIDIA backend (`nvidia-smi` + `nvidia-ctk`) for running this same mechanism
+against an actual GPU node instead of the mock device — see
+`config/dra/README.md`, including that section's honesty note on what has and
+hasn't been run against real hardware.
 
 The predictive/adaptive autoscaling loop and fairness arbiter from the
 research docs are still out of scope for this build.

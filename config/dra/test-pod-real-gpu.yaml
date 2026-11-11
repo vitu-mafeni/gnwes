@@ -1,0 +1,23 @@
+# Verifies the REAL GPU backend end to end. Use this instead of test-pod.yaml
+# when driver-real-gpu.yaml (not driver.yaml) is deployed. Uses an NVIDIA
+# CUDA base image (not busybox) specifically so nvidia-smi exists inside the
+# container, to prove the CDI-injected device nodes and driver libraries are
+# real and usable -- not just that an env var got set.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gnwes-dra-test-real-gpu
+  namespace: gnwes-dra-demo
+spec:
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  resourceClaims:
+  - name: gpu
+    resourceClaimTemplateName: gnwes-mock-gpu
+  containers:
+  - name: test
+    image: nvcr.io/nvidia/cuda:12.6.0-base-ubuntu22.04
+    command: ["sleep", "infinity"]
+    resources:
+      claims:
+      - name: gpu

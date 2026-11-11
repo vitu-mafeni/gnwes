@@ -129,6 +129,19 @@ kubectl exec gnwes-dra-test -n gnwes-dra-demo -- env | grep GNWES_MOCK_GPU
 See `config/dra/README.md` for exactly what's real vs mocked here, and the
 Substrate `WorkerPoolPodTemplate` gap this surfaced.
 
+**Testing on a real GPU node instead of mock devices:** `cmd/mock-gpu-driver`
+now has a real NVIDIA backend (`GNWES_GPU_BACKEND=nvidia`) that discovers
+actual GPUs via `nvidia-smi` and generates a real CDI spec via `nvidia-ctk`
+(the real NVIDIA Container Toolkit tool) instead of a hand-written fake one.
+Use `config/dra/driver-real-gpu.yaml` + `config/dra/test-pod-real-gpu.yaml`
+in place of `driver.yaml`/`test-pod.yaml`, and verify with
+`kubectl exec ... -- nvidia-smi` instead of the `env | grep` check above. See
+`config/dra/README.md`'s "Running on real GPU nodes" section for the full
+walkthrough and prerequisites — **this path is code-reviewed, built, and unit
+tested, but not yet run against real hardware**, since none exists in this
+project's dev environment; treat your first run on a real GPU node as the
+actual test of it.
+
 ---
 
 ## 4. Tier 3 — real Agent Substrate integration

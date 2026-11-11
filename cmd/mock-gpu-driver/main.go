@@ -1,17 +1,22 @@
 // Command mock-gpu-driver is a real Kubernetes DRA (Dynamic Resource
-// Allocation) kubelet plugin. It registers with kubelet, publishes a fixed
-// number of devices per node via a real ResourceSlice, and on
-// PrepareResourceClaims (the gRPC NodePrepareResources call) writes a real
-// CDI (Container Device Interface) spec file and returns its CDI device ID,
-// which kubelet/containerd then actually inject into the container.
+// Allocation) kubelet plugin. It registers with kubelet, publishes devices
+// per node via a real ResourceSlice, and on PrepareResourceClaims (the gRPC
+// NodePrepareResources call) ensures a real CDI (Container Device Interface)
+// spec exists and returns the CDI device ID, which kubelet/containerd then
+// actually inject into the container.
 //
-// Only the device itself is fake: there is no real NVIDIA GPU behind it.
+// Device discovery and CDI preparation are delegated to a gpuBackend
+// (backend.go / nvidia.go), selected via the GNWES_GPU_BACKEND env var:
+//   - "mock" (default) — a fake device, no real GPU hardware involved.
+//   - "nvidia" — real GPUs via nvidia-smi + nvidia-ctk; see nvidia.go and
+//     config/dra/README.md's "Running on real GPU nodes" section.
+//
 // Everything else here — ResourceSlice publication, the kubelet plugin
-// registration handshake, PrepareResourceClaims/UnprepareResourceClaims, the
-// CDI spec file, and its injection into the container — is the real
-// mechanism, built on the same k8s.io/dynamic-resource-allocation helper
-// library and tags.cncf.io/container-device-interface spec types a real GPU
-// vendor driver would use.
+// registration handshake, PrepareResourceClaims/UnprepareResourceClaims, and
+// CDI spec injection into the container — is the real mechanism, built on
+// the same k8s.io/dynamic-resource-allocation helper library and
+// tags.cncf.io/container-device-interface spec types a real GPU vendor
+// driver would use, for both backends.
 package main
 
 import (
@@ -30,15 +35,10 @@ import (
 
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
-	cdi "tags.cncf.io/container-device-interface/pkg/cdi"
-	cdispec "tags.cncf.io/container-device-interface/specs-go"
 )
 
 const (
 	driverName  = "mock-gpu.gnwes.io"
-	cdiVendor   = "gnwes.io"
-	cdiClass    = "mockgpu"
-	numDevices  = 4
 	poolNameFmt = "mock-gpu-%s" // formatted with node name
 )
 
@@ -47,6 +47,9 @@ func main() {
 	if nodeName == "" {
 		log.Fatal("NODE_NAME env var is required")
 	}
+
+	backend := selectBackend()
+	log.Printf("using backend: %s", backend.Name())
 
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
@@ -68,7 +71,7 @@ func main() {
 		log.Fatalf("creating plugin directory %s: %v", pluginDir, err)
 	}
 
-	plugin := &driver{nodeName: nodeName, prepared: map[types.UID]string{}}
+	plugin := &driver{backend: backend, nodeName: nodeName, prepared: map[types.UID]string{}}
 
 	helper, err := kubeletplugin.Start(
 		ctx,
@@ -82,9 +85,9 @@ func main() {
 	}
 	plugin.helper = helper
 
-	devices := make([]resourceapi.Device, numDevices)
-	for i := range devices {
-		devices[i] = resourceapi.Device{Name: fmt.Sprintf("mock-gpu-%d", i)}
+	devices, err := backend.Devices()
+	if err != nil {
+		log.Fatalf("listing devices: %v", err)
 	}
 	resources := resourceslice.DriverResources{
 		Pools: map[string]resourceslice.Pool{
@@ -97,13 +100,26 @@ func main() {
 		log.Fatalf("publishing ResourceSlice: %v", err)
 	}
 
-	log.Printf("mock-gpu-driver ready on node %s, published %d devices", nodeName, numDevices)
+	log.Printf("%s ready on node %s, published %d devices", driverName, nodeName, len(devices))
 	<-ctx.Done()
 	log.Printf("shutting down")
 }
 
+func selectBackend() gpuBackend {
+	switch v := os.Getenv("GNWES_GPU_BACKEND"); v {
+	case "", "mock":
+		return &mockBackend{}
+	case "nvidia":
+		return newNvidiaBackend()
+	default:
+		log.Fatalf("unknown GNWES_GPU_BACKEND %q (want \"mock\" or \"nvidia\")", v)
+		return nil
+	}
+}
+
 // driver implements kubeletplugin.DRAPlugin.
 type driver struct {
+	backend  gpuBackend
 	nodeName string
 	helper   *kubeletplugin.Helper
 
@@ -127,10 +143,9 @@ func (d *driver) PrepareResourceClaims(ctx context.Context, claims []*resourceap
 			}
 
 			deviceName := alloc.Device
-			cdiDeviceID := fmt.Sprintf("%s/%s=%s", cdiVendor, cdiClass, deviceName)
-
-			if err := d.writeCDISpec(deviceName, string(claim.UID)); err != nil {
-				result[claim.UID] = kubeletplugin.PrepareResult{Err: fmt.Errorf("writing CDI spec for %s: %w", deviceName, err)}
+			cdiDeviceID, err := d.backend.Prepare(deviceName, string(claim.UID))
+			if err != nil {
+				result[claim.UID] = kubeletplugin.PrepareResult{Err: fmt.Errorf("preparing device %s: %w", deviceName, err)}
 				continue
 			}
 
@@ -164,9 +179,7 @@ func (d *driver) UnprepareResourceClaims(ctx context.Context, claims []kubeletpl
 		d.mu.Unlock()
 
 		if ok {
-			if err := cdi.GetDefaultCache().RemoveSpec(cdi.GenerateTransientSpecName(cdiVendor, cdiClass, string(claim.UID))); err != nil {
-				log.Printf("removing CDI spec for claim %s: %v (non-fatal)", claim.UID, err)
-			}
+			d.backend.Unprepare(deviceName, string(claim.UID))
 			log.Printf("unprepared claim %s/%s: released device=%s", claim.Namespace, claim.Name, deviceName)
 		}
 		result[claim.UID] = nil
@@ -180,28 +193,4 @@ func (d *driver) HandleError(ctx context.Context, err error, msg string) {
 
 func (d *driver) WatchHealthStatus(ctx context.Context, reports chan<- kubeletplugin.DeviceHealthReport) error {
 	return kubeletplugin.ErrHealthNotSupported
-}
-
-// writeCDISpec writes a real CDI spec file for deviceName. The only thing
-// mocked here is the edit itself (an env var, not a real device node) —
-// writing the file, naming it uniquely per claim (per CDI's own guidance to
-// avoid stale container-runtime cache hits), and registering it in a
-// directory containerd actually watches (/etc/cdi, see config/dra/README.md)
-// are all real.
-func (d *driver) writeCDISpec(deviceName, claimUID string) error {
-	spec := &cdispec.Spec{
-		Version: cdispec.CurrentVersion,
-		Kind:    cdiVendor + "/" + cdiClass,
-		Devices: []cdispec.Device{{
-			Name: deviceName,
-			ContainerEdits: cdispec.ContainerEdits{
-				Env: []string{
-					"GNWES_MOCK_GPU_SLOT=" + deviceName,
-					"GNWES_MOCK_GPU_NOTE=stand-in-device-not-real-nvidia-hardware",
-				},
-			},
-		}},
-	}
-	name := cdi.GenerateTransientSpecName(cdiVendor, cdiClass, claimUID)
-	return cdi.GetDefaultCache().WriteSpec(spec, name+".json")
 }
