@@ -53,7 +53,7 @@ func postReview(t *testing.T, pod *corev1.Pod, bridgeImage string, vfioIOMMUGrou
 
 	req := httptest.NewRequest(http.MethodPost, "/mutate", bytes.NewReader(reviewRaw))
 	rw := httptest.NewRecorder()
-	handleMutate(rw, req, bridgeImage, "", vfioIOMMUGroups)
+	handleMutate(rw, req, bridgeImage, "", vfioIOMMUGroups, defaultVGPUSchedulerName, defaultVGPURuntimeClassName)
 
 	var gotReview admissionv1.AdmissionReview
 	if err := json.Unmarshal(rw.Body.Bytes(), &gotReview); err != nil {
@@ -106,11 +106,11 @@ func TestHandleMutate_RequestsVolcanoVGPUSliceWhenLabeled(t *testing.T) {
 	}
 	got := postReview(t, pod, "unused:latest")
 
-	if got.Spec.SchedulerName != vgpuSchedulerName {
-		t.Errorf("SchedulerName = %q, want %q", got.Spec.SchedulerName, vgpuSchedulerName)
+	if got.Spec.SchedulerName != defaultVGPUSchedulerName {
+		t.Errorf("SchedulerName = %q, want %q", got.Spec.SchedulerName, defaultVGPUSchedulerName)
 	}
-	if got.Spec.RuntimeClassName == nil || *got.Spec.RuntimeClassName != vgpuRuntimeClassName {
-		t.Errorf("RuntimeClassName = %v, want %q", got.Spec.RuntimeClassName, vgpuRuntimeClassName)
+	if got.Spec.RuntimeClassName == nil || *got.Spec.RuntimeClassName != defaultVGPURuntimeClassName {
+		t.Errorf("RuntimeClassName = %v, want %q", got.Spec.RuntimeClassName, defaultVGPURuntimeClassName)
 	}
 	worker := got.Spec.Containers[0]
 	if worker.Resources.Limits[resourceVGPUMemory] != resource.MustParse("12") {
@@ -133,6 +133,60 @@ func TestHandleMutate_RequestsVolcanoVGPUSliceWhenLabeled(t *testing.T) {
 		if !found[name] {
 			t.Errorf("missing disabled env var %s, got env: %+v", name, worker.Env)
 		}
+	}
+}
+
+// TestHandleMutate_RespectsOverriddenVGPUSchedulerAndRuntimeClassNames
+// guards against vgpuSchedulerName/vgpuRuntimeClassName becoming
+// hardcoded constants again (as they were before 2026-11-15): a cluster
+// whose Volcano install uses different names must be able to override
+// them via VGPU_SCHEDULER_NAME/VGPU_RUNTIME_CLASS_NAME (see main), not
+// just this project's own real defaults.
+func TestHandleMutate_RespectsOverriddenVGPUSchedulerAndRuntimeClassNames(t *testing.T) {
+	pod := workerPod(map[string]string{
+		labelPoolRef:         "pool-a",
+		labelVGPUMemoryUnits: "12",
+		labelVGPUCores:       "30",
+	})
+	podRaw, err := json.Marshal(pod)
+	if err != nil {
+		t.Fatalf("marshal pod: %v", err)
+	}
+	review := admissionv1.AdmissionReview{
+		TypeMeta: metav1.TypeMeta{APIVersion: "admission.k8s.io/v1", Kind: "AdmissionReview"},
+		Request:  &admissionv1.AdmissionRequest{UID: types.UID("test-uid"), Object: runtime.RawExtension{Raw: podRaw}},
+	}
+	reviewRaw, err := json.Marshal(review)
+	if err != nil {
+		t.Fatalf("marshal review: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/mutate", bytes.NewReader(reviewRaw))
+	rw := httptest.NewRecorder()
+	handleMutate(rw, req, "unused:latest", "", nil, "custom-scheduler", "custom-runtime-class")
+
+	var gotReview admissionv1.AdmissionReview
+	if err := json.Unmarshal(rw.Body.Bytes(), &gotReview); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	patchBytes, err := json.Marshal(gotReview.Response.Patch)
+	if err != nil {
+		t.Fatalf("marshal raw patch: %v", err)
+	}
+	var patches []map[string]any
+	if err := json.Unmarshal(gotReview.Response.Patch, &patches); err != nil {
+		t.Fatalf("unmarshal patches %s: %v", patchBytes, err)
+	}
+	got, err := applyPatches(t, pod, patches)
+	if err != nil {
+		t.Fatalf("applying patches: %v", err)
+	}
+
+	if got.Spec.SchedulerName != "custom-scheduler" {
+		t.Errorf("SchedulerName = %q, want %q", got.Spec.SchedulerName, "custom-scheduler")
+	}
+	if got.Spec.RuntimeClassName == nil || *got.Spec.RuntimeClassName != "custom-runtime-class" {
+		t.Errorf("RuntimeClassName = %v, want %q", got.Spec.RuntimeClassName, "custom-runtime-class")
 	}
 }
 
@@ -220,7 +274,7 @@ func TestWorkerEnvPatches_IncludesExtraVarsInOneAppendPass(t *testing.T) {
 
 func TestVolcanoVGPUPatches_NoLabelsReturnsNilNil(t *testing.T) {
 	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: workerContainerName}}}}
-	patches, err := volcanoVGPUPatches(pod)
+	patches, err := volcanoVGPUPatches(pod, defaultVGPUSchedulerName, defaultVGPURuntimeClassName)
 	if err != nil || patches != nil {
 		t.Fatalf("got patches=%v err=%v, want nil, nil when neither vGPU label is set", patches, err)
 	}
@@ -231,7 +285,7 @@ func TestVolcanoVGPUPatches_OnlyOneLabelErrors(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labelVGPUMemoryUnits: "12"}},
 		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: workerContainerName}}},
 	}
-	if _, err := volcanoVGPUPatches(pod); err == nil {
+	if _, err := volcanoVGPUPatches(pod, defaultVGPUSchedulerName, defaultVGPURuntimeClassName); err == nil {
 		t.Fatal("expected an error when only one of the two vGPU labels is set")
 	}
 }
@@ -247,7 +301,7 @@ func TestVolcanoVGPUPatches_SetsSchedulerRuntimeClassAndResources(t *testing.T) 
 			},
 		}}},
 	}
-	patches, err := volcanoVGPUPatches(pod)
+	patches, err := volcanoVGPUPatches(pod, defaultVGPUSchedulerName, defaultVGPURuntimeClassName)
 	if err != nil {
 		t.Fatalf("volcanoVGPUPatches: %v", err)
 	}
@@ -256,11 +310,11 @@ func TestVolcanoVGPUPatches_SetsSchedulerRuntimeClassAndResources(t *testing.T) 
 	if err != nil {
 		t.Fatalf("applying patches: %v", err)
 	}
-	if patched.Spec.SchedulerName != vgpuSchedulerName {
-		t.Errorf("SchedulerName = %q, want %q", patched.Spec.SchedulerName, vgpuSchedulerName)
+	if patched.Spec.SchedulerName != defaultVGPUSchedulerName {
+		t.Errorf("SchedulerName = %q, want %q", patched.Spec.SchedulerName, defaultVGPUSchedulerName)
 	}
-	if patched.Spec.RuntimeClassName == nil || *patched.Spec.RuntimeClassName != vgpuRuntimeClassName {
-		t.Errorf("RuntimeClassName = %v, want %q", patched.Spec.RuntimeClassName, vgpuRuntimeClassName)
+	if patched.Spec.RuntimeClassName == nil || *patched.Spec.RuntimeClassName != defaultVGPURuntimeClassName {
+		t.Errorf("RuntimeClassName = %v, want %q", patched.Spec.RuntimeClassName, defaultVGPURuntimeClassName)
 	}
 	worker := patched.Spec.Containers[0]
 	for _, c := range []struct {
@@ -288,7 +342,7 @@ func TestVolcanoVGPUPatches_CreatesResourcesWhenAbsent(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labelVGPUMemoryUnits: "12", labelVGPUCores: "30"}},
 		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: workerContainerName}}},
 	}
-	patches, err := volcanoVGPUPatches(pod)
+	patches, err := volcanoVGPUPatches(pod, defaultVGPUSchedulerName, defaultVGPURuntimeClassName)
 	if err != nil {
 		t.Fatalf("volcanoVGPUPatches: %v", err)
 	}

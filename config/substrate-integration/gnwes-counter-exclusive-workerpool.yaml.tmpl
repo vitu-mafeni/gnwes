@@ -57,10 +57,15 @@ spec:
     # Pinned to this cluster's one GPU-VFIO-bound node: ate.dev/kvm alone
     # isn't enough if more than one node advertises it (e.g. a control-plane
     # node that also happens to have /dev/kvm) -- the real GPU this pool's
-    # VFIOGPUPool references is physically on dcn-gpu-0's PCI bus, so this
-    # workload must land there specifically, not just "somewhere with KVM".
+    # VFIOGPUPool references is physically on one specific node's PCI bus,
+    # so this workload must land there specifically, not just "somewhere
+    # with KVM". Deliberately a generic node label, not a hardcoded
+    # hostname (this project's own cluster's GPU node happens to be named
+    # dcn-gpu-0, but that name is not portable to a different cluster) --
+    # apply it once per cluster:
+    #   kubectl label node <your-vfio-gpu-node> gnwes.io/exclusive-gpu-node=true
     nodeSelector:
-      kubernetes.io/hostname: dcn-gpu-0
+      gnwes.io/exclusive-gpu-node: "true"
     serviceAccountName: gnwes-substrate-gpu-bridge
     resources:
       limits:

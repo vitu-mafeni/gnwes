@@ -448,6 +448,13 @@ be missing every one of them:
    (see 4.5) — a stale local one fails with `x509: certificate signed by
    unknown authority`. Simplest fix: copy the control-plane node's own
    kubeconfig over rather than debugging the stale one.
+5. **Label the GPU node itself** — `gnwes-counter-exclusive-workerpool.yaml.tmpl`'s
+   `nodeSelector` targets a generic label, not a hardcoded hostname, so
+   this pins the demo to the right node without editing the template per
+   cluster:
+   ```bash
+   kubectl label node dcn-gpu-0 gnwes.io/exclusive-gpu-node=true   # or whichever node has the GPU
+   ```
 
 ### 4.1 — RBAC + the real VFIOGPUPool
 

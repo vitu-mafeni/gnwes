@@ -102,8 +102,14 @@ const (
 	labelVGPUMemoryUnits = "gnwes.io/vgpu-memory-units"
 	labelVGPUCores       = "gnwes.io/vgpu-cores"
 
-	vgpuSchedulerName    = "volcano"
-	vgpuRuntimeClassName = "nvidia-legacy"
+	// defaultVGPUSchedulerName/defaultVGPURuntimeClassName match this
+	// project's own real cluster (see labelVGPUMemoryUnits's doc comment)
+	// but are NOT assumed true of every cluster -- a different Volcano
+	// install could name its runtime handler differently, so both are
+	// overridable via VGPU_SCHEDULER_NAME/VGPU_RUNTIME_CLASS_NAME (see
+	// main), the same env-var-with-default pattern as BRIDGE_IMAGE.
+	defaultVGPUSchedulerName    = "volcano"
+	defaultVGPURuntimeClassName = "nvidia-legacy"
 
 	resourceVGPUNumber = "volcano.sh/vgpu-number"
 	resourceVGPUMemory = "volcano.sh/vgpu-memory"
@@ -142,9 +148,12 @@ func main() {
 	// (or one that hasn't set this yet) just never gets the annotation.
 	vfioIOMMUGroups := parseCommaList(envOr("VFIO_IOMMU_GROUPS", ""))
 
+	vgpuSchedulerName := envOr("VGPU_SCHEDULER_NAME", defaultVGPUSchedulerName)
+	vgpuRuntimeClassName := envOr("VGPU_RUNTIME_CLASS_NAME", defaultVGPURuntimeClassName)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mutate", func(w http.ResponseWriter, r *http.Request) {
-		handleMutate(w, r, bridgeImage, bridgeImagePullPolicy, vfioIOMMUGroups)
+		handleMutate(w, r, bridgeImage, bridgeImagePullPolicy, vfioIOMMUGroups, vgpuSchedulerName, vgpuRuntimeClassName)
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
@@ -153,7 +162,7 @@ func main() {
 	log.Fatal(srv.ListenAndServeTLS(certFile, keyFile))
 }
 
-func handleMutate(w http.ResponseWriter, r *http.Request, bridgeImage, bridgeImagePullPolicy string, vfioIOMMUGroups []string) {
+func handleMutate(w http.ResponseWriter, r *http.Request, bridgeImage, bridgeImagePullPolicy string, vfioIOMMUGroups []string, vgpuSchedulerName, vgpuRuntimeClassName string) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -187,7 +196,7 @@ func handleMutate(w http.ResponseWriter, r *http.Request, bridgeImage, bridgeIma
 			// comment for why two independent append-tracking passes on
 			// the same array would corrupt each other.
 			var extraEnv []corev1.EnvVar
-			if vgpuPatches, err := volcanoVGPUPatches(&pod); err != nil {
+			if vgpuPatches, err := volcanoVGPUPatches(&pod, vgpuSchedulerName, vgpuRuntimeClassName); err != nil {
 				log.Printf("not requesting a Volcano vGPU slice for pod %s/%s: %v", pod.Namespace, pod.Name, err)
 			} else if len(vgpuPatches) > 0 {
 				patches = append(patches, vgpuPatches...)
@@ -352,7 +361,7 @@ func jsonPointerEscape(s string) string {
 // volcano.sh/vgpu-memory: 768 = 2 physical 24576 MiB GPUs / 64), not raw
 // MiB -- labelVGPUMemoryUnits's value is passed straight through as that
 // unit count, not converted.
-func volcanoVGPUPatches(pod *corev1.Pod) ([]map[string]any, error) {
+func volcanoVGPUPatches(pod *corev1.Pod, vgpuSchedulerName, vgpuRuntimeClassName string) ([]map[string]any, error) {
 	memUnits, hasMem := pod.Labels[labelVGPUMemoryUnits]
 	cores, hasCores := pod.Labels[labelVGPUCores]
 	if !hasMem && !hasCores {

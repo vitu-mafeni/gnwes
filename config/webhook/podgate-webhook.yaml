@@ -37,6 +37,14 @@ spec:
         # functions) on 2026-11-14. Comma-separate multiple groups.
         - name: VFIO_IOMMU_GROUPS
           value: "8"
+        # Overrides only needed on a cluster whose Volcano vGPU install uses
+        # different names -- this project's own real cluster uses exactly
+        # these defaults (confirmed live 2026-11-15), so both are commented
+        # out rather than redundantly repeating the binary's own defaults.
+        # - name: VGPU_SCHEDULER_NAME
+        #   value: volcano
+        # - name: VGPU_RUNTIME_CLASS_NAME
+        #   value: nvidia-legacy
         ports:
         - containerPort: 8443
         readinessProbe:
