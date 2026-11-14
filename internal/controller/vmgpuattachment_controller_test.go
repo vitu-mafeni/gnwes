@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -278,6 +280,112 @@ func TestVMGPUAttachment_AddDeviceFailureReleasesDeviceAndSetsFailed(t *testing.
 	d, ok := pool.Get("gpu-0")
 	if !ok || d.State != vfiopool.DeviceAvailable {
 		t.Fatalf("device after failed AddDevice = %+v (ok=%v), want Available (released back)", d, ok)
+	}
+}
+
+// TestVMGPUAttachment_RemoveDeviceFailureReleasesDeviceWhenVMIsGone covers a
+// real bug found live (2026-11-14): Agent Substrate's actor suspend fully
+// tears down the microVM's whole working directory, not just pauses the VM,
+// so vm.remove-device can never succeed once that happens -- see vmGone's
+// doc comment. Before this fix, the device stayed stuck "held" in the pool
+// forever, with reconcileDetach retrying a permanently-dead socket once a
+// second.
+func TestVMGPUAttachment_RemoveDeviceFailureReleasesDeviceWhenVMIsGone(t *testing.T) {
+	att, mgr, pool := newVMGPUTestObjects(t)
+	att.Spec.APISocket = filepath.Join(t.TempDir(), "nonexistent", "clh-api.sock") // never created
+	fc := newFakeClient(t, att)
+	ch := newFakeCH()
+	r := &VMGPUAttachmentReconciler{Client: fc, VFIOManager: mgr, NewCHClient: func(string) CHDevicePlugger { return ch }}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "att-a", Namespace: "ns1"}}
+
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile 1 (attach): %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile 2 (attach): %v", err)
+	}
+
+	ch.mu.Lock()
+	ch.removeErr = fmt.Errorf("dial unix %s: connect: no such file or directory", att.Spec.APISocket)
+	ch.mu.Unlock()
+
+	var got gnwesv1alpha1.VMGPUAttachment
+	if err := fc.Get(context.Background(), req.NamespacedName, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got.Spec.DesiredState = gnwesv1alpha1.VMGPUDesiredDetached
+	if err := fc.Update(context.Background(), &got); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile (detach): %v", err)
+	}
+
+	if err := fc.Get(context.Background(), req.NamespacedName, &got); err != nil {
+		t.Fatalf("Get after detach: %v", err)
+	}
+	if got.Status.Phase != gnwesv1alpha1.VMGPUPhaseDetached {
+		t.Fatalf("Phase = %q, want Detached even though RemoveDevice failed, since the VM's api-socket is gone (message: %s)", got.Status.Phase, got.Status.Message)
+	}
+
+	d, ok := pool.Get("gpu-0")
+	if !ok || d.State != vfiopool.DeviceAvailable {
+		t.Fatalf("device after a RemoveDevice failure with the VM gone = %+v (ok=%v), want Available (released back) -- otherwise the device leaks out of the pool forever", d, ok)
+	}
+}
+
+// TestVMGPUAttachment_RemoveDeviceFailureStaysFailedWhenSocketStillExists is
+// the regression guard: a RemoveDevice failure must NOT release the device
+// while the VM's api-socket still exists on disk, since that would let a
+// second actor acquire the same physical device while the first might still
+// be using it.
+func TestVMGPUAttachment_RemoveDeviceFailureStaysFailedWhenSocketStillExists(t *testing.T) {
+	att, mgr, pool := newVMGPUTestObjects(t)
+	socketPath := filepath.Join(t.TempDir(), "clh-api.sock")
+	if err := os.WriteFile(socketPath, nil, 0o600); err != nil {
+		t.Fatalf("creating fake socket file: %v", err)
+	}
+	att.Spec.APISocket = socketPath
+	fc := newFakeClient(t, att)
+	ch := newFakeCH()
+	r := &VMGPUAttachmentReconciler{Client: fc, VFIOManager: mgr, NewCHClient: func(string) CHDevicePlugger { return ch }}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "att-a", Namespace: "ns1"}}
+
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile 1 (attach): %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile 2 (attach): %v", err)
+	}
+
+	ch.mu.Lock()
+	ch.removeErr = fmt.Errorf("simulated vm.remove-device failure")
+	ch.mu.Unlock()
+
+	var got gnwesv1alpha1.VMGPUAttachment
+	if err := fc.Get(context.Background(), req.NamespacedName, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got.Spec.DesiredState = gnwesv1alpha1.VMGPUDesiredDetached
+	if err := fc.Update(context.Background(), &got); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile (detach): %v", err)
+	}
+
+	if err := fc.Get(context.Background(), req.NamespacedName, &got); err != nil {
+		t.Fatalf("Get after detach attempt: %v", err)
+	}
+	if got.Status.Phase != gnwesv1alpha1.VMGPUPhaseFailed {
+		t.Fatalf("Phase = %q, want Failed -- the socket file still exists, so a real RemoveDevice failure must keep retrying, not silently release the device", got.Status.Phase)
+	}
+
+	d, ok := pool.Get("gpu-0")
+	if !ok || d.State != vfiopool.DeviceAttached {
+		t.Fatalf("device while socket still exists = %+v (ok=%v), want still Attached (not released)", d, ok)
 	}
 }
 

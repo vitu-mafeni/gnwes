@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -196,10 +197,13 @@ func (r *VMGPUAttachmentReconciler) reconcileDetach(ctx context.Context, att *gn
 	requestedAt := r.markTransitionStart(att.UID, gnwesv1alpha1.VMGPUDesiredDetached)
 
 	deviceID := att.Status.DeviceID
-	if err := ch.RemoveDevice(ctx, deviceID); err != nil {
+	if err := ch.RemoveDevice(ctx, deviceID); err != nil && !r.vmGone(att.Spec.APISocket) {
 		att.Status.Phase = gnwesv1alpha1.VMGPUPhaseFailed
 		att.Status.Message = fmt.Sprintf("vm.remove-device failed for device %q: %v", deviceID, err)
 		return ctrl.Result{RequeueAfter: time.Second}, r.Status().Update(ctx, att)
+	} else if err != nil {
+		log.FromContext(ctx).Info("vm.remove-device failed but the VM's own api-socket is gone; treating the device as already freed",
+			"attachment", attachKey, "device", deviceID, "apiSocket", att.Spec.APISocket, "err", err)
 	}
 
 	if p := r.VFIOManager.GetPool(poolKey); p != nil {
@@ -218,6 +222,29 @@ func (r *VMGPUAttachmentReconciler) reconcileDetach(ctx context.Context, att *gn
 
 	log.FromContext(ctx).Info("vmgpuattachment detached", "attachment", attachKey, "device", deviceID, "detachMs", att.Status.AttachLatencyMillis)
 	return ctrl.Result{}, r.Status().Update(ctx, att)
+}
+
+// vmGone reports whether apiSocket's path no longer exists on this node's
+// filesystem -- a definitive signal, not a transient dial hiccup (chclient's
+// own doWithDialRetry already absorbs those before RemoveDevice ever
+// returns an error here), that the cloud-hypervisor VM which owned it is
+// gone. Confirmed live (2026-11-14): Agent Substrate's actor suspend fully
+// tears down the microVM's entire working directory (socket, console.log,
+// everything), not just pauses the VM -- so a hot vm.remove-device call
+// this reconciler's detach path assumed would still work can never
+// succeed, and it was retrying a permanently-dead socket once a second
+// forever, with the device stuck "held" in the pool (VFIOGPUPool's
+// availableDevices never recovering) since Release() only ran on success.
+// When the VM process itself is gone, whatever VFIO device it held is
+// already back with the host kernel regardless (closing a process's VFIO
+// container file descriptor -- which happens unconditionally on exit --
+// is what actually releases a VFIO device, not any API call cloud-
+// hypervisor exposes), so there is nothing left to hot-remove, and this
+// lets reconcileDetach correctly recognize that instead of leaking the
+// device out of the pool's own bookkeeping permanently.
+func (r *VMGPUAttachmentReconciler) vmGone(apiSocket string) bool {
+	_, err := os.Stat(apiSocket)
+	return os.IsNotExist(err)
 }
 
 func (r *VMGPUAttachmentReconciler) chClient(apiSocket string) CHDevicePlugger {
