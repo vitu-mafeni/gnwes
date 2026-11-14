@@ -121,6 +121,18 @@ substrate-gpu-bridge \
   verification available in this environment — the only boundary still not
   crossed is cloud-hypervisor itself (next item).
 
+**Updated 2026-11-13:** the real run above used the bridge's *old*
+interface, which watched one actor by a fixed name passed at deploy time.
+That assumption was always going to break the moment a worker pod hosted a
+second actor after the first (exactly what "a worker pod is reused across
+many actors" means) — the bridge now resolves whichever actor is *currently*
+assigned to its worker pod instead (`internal/substratebridge`, see
+`config/substrate-integration/REPRODUCTION-GUIDE.md`'s "Known limitations"
+for the precise gap this closed and what's still unverified about it). The
+CLI example right below reflects the new flags; it has not itself been
+re-run against real hardware since the change — only the fetch/parse logic
+behind it is unit-tested (see `internal/substratebridge/kubectlate_test.go`).
+
 ## What's NOT verified
 
 - ~~No real cloud-hypervisor instance, no real VFIO GPU, no real guest~~ —
@@ -132,13 +144,74 @@ substrate-gpu-bridge \
   the real obstacles hit (NVIDIA driver live-unbind reproducibly wedging
   while actively managed, fixed by excluding the GPU from `nvidia.ko` at
   boot via an initramfs hook instead of live-unbinding it).
-- **No real Substrate `ateworker-microvm` deployment exercised.** The
-  `config/substrate-integration` work so far (and the real-actor bridge
-  test above) used Substrate's gVisor worker, not its microVM one. Wiring
-  this against a real one needs a machine with nested virtualization,
-  standing that worker type up, and confirming the guest's NVIDIA driver
-  actually re-probes a hot-added PCI device without a reboot (also
-  unconfirmed — see `research/live-attach-poc/README.md`'s "Next steps").
+- ~~No real end-to-end hardware run of the microVM worker path has been
+  performed in this repo yet~~ — **resolved 2026-11-14.** A real
+  `gnwes-counter-exclusive-*` worker pod (`sandboxClasses: [microvm]`)
+  reached `2/2 Running` on `dcn-gpu-0`, a real actor resumed onto it, and
+  its `VMGPUAttachment` reached `phase: Attached` with a real `deviceID`
+  (`gpu-exclusive-0`) and `guestBDF` (`"0000:00:08.0"`) —
+  cloud-hypervisor's own `vm.add-device` call succeeding against its real
+  nested-VM guest. The remaining blocker when this was last written —
+  getting the worker container real VFIO device access without
+  `privileged: true` (incompatible with `ateworker-microvm`'s own startup
+  check, see below) — turned out to need node-level CRI-O config, not just
+  webhook changes:
+  1. The node's CRI-O config (`/etc/crio/crio.conf.d/`, **not** automated
+     by anything in this repo — a one-time per-node setup step) needs
+     `allowed_annotations = ["io.kubernetes.cri-o.Devices"]` and
+     `allowed_devices = ["/dev/vfio/vfio", "/dev/vfio/<iommu-group>"]`
+     added to whichever runtime handler is active for worker pods (here,
+     `runc`, confirmed via `crio config`'s resolved `default_runtime` and
+     no pod on the cluster setting a `runtimeClassName`), followed by a
+     `systemctl restart crio`.
+  2. `podgate-webhook` now sets the `io.kubernetes.cri-o.Devices` pod
+     annotation (`cmd/podgate-webhook/main.go`'s
+     `vfioDevicesAnnotationValue`) from a new `VFIO_IOMMU_GROUPS` env var
+     (comma-separated IOMMU group numbers; this cluster's single TITAN RTX
+     is group 8) — in addition to the `/dev/vfio` hostPath mount it already
+     added, which makes the device path resolve but, on its own, still
+     leaves the kernel's device cgroup blocking `open()` with `EPERM`.
+  See `config/substrate-integration/REPRODUCTION-GUIDE.md`'s "Known
+  limitations" (Exclusive tier) for the full account, including an earlier
+  bug in `internal/chclient`'s `Iommu` field (string vs. the real
+  cloud-hypervisor API's boolean) and a missing watch predicate on
+  `VMGPUAttachmentReconciler` that both had to be fixed first to even see
+  this EPERM clearly. **Still not confirmed either way**: whether the
+  guest's NVIDIA driver actually re-probes the hot-added PCI device without
+  a reboot — this run confirmed the host-side attach (cloud-hypervisor's
+  API call and `guestBDF` assignment), not what the guest OS does with it
+  afterward. See `research/live-attach-poc/README.md`'s "Next steps".
+  **What IS now done (2026-11-13):** `ateworker-microvm` turned out to
+  already exist and ship upstream in agent-substrate (Kata on
+  cloud-hypervisor, confirmed via `pkg/sandboxclass.All()` and
+  `docs/reference/sandbox-classes.md` in the real repo) — it was never
+  actually missing infrastructure, just never exercised by this
+  integration. Three things changed to actually exercise it:
+  1. `GPUWorkerPoolReconciler.reconcileExclusive`
+     (`internal/controller/gpuworkerpool_controller.go`) creates one
+     `VMGPUAttachment` per real Exclusive-tier worker pod immediately
+     (`Detached`, empty `apiSocket`) — it no longer waits on a static
+     `gnwes.io/ch-api-socket` pod annotation, which was always going to be
+     wrong anyway: cloud-hypervisor's api-socket path is keyed by actor UID
+     (`/run/vc/vm/<actor-uid>/clh-api.sock`), not by pod, since a worker pod
+     reuses its VM lifecycle across many sequential actors.
+  2. `cmd/substrate-gpu-bridge` (`internal/substratebridge`) now resolves
+     whichever actor is *currently* assigned to its worker pod (there is no
+     fixed actor to watch) and writes `apiSocket` and `desiredState`
+     together from that actor's real UID, instead of the old fixed
+     `-actor` flag that would have paired `Attached` with a stale socket
+     path the moment a second actor ever reused the pod.
+  3. `podgate-webhook` now injects the bridge as a sidecar (plus the shared
+     `/run/vc/vm` emptyDir volume it needs) into every pod labeled
+     `gnwes.io/gpu-backend: Exclusive`, reading `-atespace` off a
+     `gnwes.io/atespace` pod label and the pod's own name via the Downward
+     API — the one deployment step nothing had automated before.
+
+  See `config/substrate-integration/REPRODUCTION-GUIDE.md`'s Phase 4 for
+  the actual manifests and apply order. The ENTIRE chain from "a real
+  worker pod exists" to "a real GPU gets hot-attached when its actor
+  resumes" is now confirmed real, wired, and run end-to-end on real
+  hardware (2026-11-14, see above) — not just unit-tested.
 - **Whether attaching earlier (during `ACTOR_STATE_RESUMING`, rather than
   waiting for fully `RUNNING`) would be worth doing for latency** is
   unexplored — `DesiredStateForActorState`'s conservative mapping was a
@@ -191,10 +264,13 @@ go build -o fakekubectlate ./cmd/fakekubectlate
 go build -o substrate-gpu-bridge ./cmd/substrate-gpu-bridge
 
 echo -n "ACTOR_STATE_SUSPENDED" > actor-state.txt
-FAKE_ACTOR_STATE_FILE="$(pwd)/actor-state.txt" ./substrate-gpu-bridge \
+# FAKE_WORKER_POD must match -worker-pod below -- fakekubectlate reports its
+# one canned actor as assigned to exactly this worker pod name, the same way
+# ParseActorForWorkerPod filters the real kubectl-ate's actor list.
+FAKE_ACTOR_STATE_FILE="$(pwd)/actor-state.txt" FAKE_WORKER_POD=actor-worker-1-gpu ./substrate-gpu-bridge \
   -kubectl-ate-bin ./fakekubectlate \
-  -atespace fake-atespace -actor fake-actor \
-  -attachment-namespace gnwes-vmgpu -attachment-name actor-worker-1-gpu \
+  -atespace fake-atespace -worker-pod actor-worker-1-gpu \
+  -attachment-namespace gnwes-vmgpu \
   -poll-interval 1s &
 
 kubectl get vmgpuattachment -n gnwes-vmgpu -o wide   # Detached
@@ -232,10 +308,13 @@ it) is enough; it's not checked into this repo since the mount path is
 specific to wherever your `agent-substrate` checkout's `bin/` lives.
 
 ```bash
+# attachment-name is implicit now: it's always the worker pod's own name
+# (-worker-pod), since GPUWorkerPoolReconciler names every VMGPUAttachment
+# after the pod it belongs to.
 substrate-gpu-bridge \
   -kubectl-ate-bin /path/to/your/kubectl-ate-docker-wrapper \
-  -atespace ate-demo-counter -actor gnwes-actor-1 \
-  -attachment-namespace gnwes-vmgpu -attachment-name actor-worker-1-gpu \
+  -atespace ate-demo-counter -worker-pod actor-worker-1 \
+  -attachment-namespace gnwes-vmgpu \
   -poll-interval 3s &
 
 # from another terminal, using the real kubectl-ate the same wrapper calls:
