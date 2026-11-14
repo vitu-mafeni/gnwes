@@ -49,6 +49,19 @@ spec:
   workerImage: ko://go.ate.dev/substrate/cmd/ateworker-microvm
   sandboxClasses:
   - name: microvm
+    # Opt-in: use the custom, driver-included Kata image
+    # (config/vmgpu/build-nvidia-kata-image.sh,
+    # sandboxconfig-microvm-nvidia-gpu.yaml) instead of the stock,
+    # driver-less one every other sandboxClasses entry on this cluster
+    # still gets by default (no configRef here, or omitted entirely).
+    # Changing an EXISTING pod's configRef has no effect until that
+    # pod is recreated (SandboxConfig resolution happens at VM
+    # creation, same "admission/creation-time only" limitation
+    # podgate-webhook's own mutations have) -- confirmed the hard way
+    # (2026-11-15): delete the pod, don't just patch the WorkerPool, to
+    # actually pick this up.
+    # configRef:
+    #   name: microvm-nvidia-gpu
   template:
     labels:
       gnwes.io/gpu-pool: gnwes-counter-exclusive-pool

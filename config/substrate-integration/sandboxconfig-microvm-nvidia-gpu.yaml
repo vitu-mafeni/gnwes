@@ -1,0 +1,60 @@
+# A second, independent SandboxConfig alongside the cluster's stock
+# "microvm" one (manifests/ate-install/sandboxconfig-microvm.yaml.tmpl,
+# applied by upstream agent-substrate's own ate-setup) -- NOT a
+# replacement for it. Points the Exclusive tier at a custom-built,
+# driver-included Kata kernel + rootfs instead of the stock,
+# driver-less ones, while any other WorkerPool still using "microvm"
+# (no configRef, or configRef: {name: microvm}) is completely
+# unaffected.
+#
+# Built by config/vmgpu/build-nvidia-kata-image.sh -- see that script
+# and config/vmgpu/README.md's 2026-11-15 "custom Kata GPU image" entry
+# for the full story: why this exists (the stock Kata guest has no
+# NVIDIA driver installed at all, so a hot-attached GPU can be enumerated
+# but never actually used), why it's NOT kata-deploy's official
+# NVIDIA GPU shims (those are QEMU-only and assign the GPU statically at
+# VM creation -- incompatible with this project's whole point, live
+# hot-attach via cloud-hypervisor), and exactly how the custom kernel
+# (built with Kata's own `-g nvidia` kernel-builder flag) and rootfs
+# (stock image + kmod/libkmod + the 4 NVIDIA .ko modules + an
+# /etc/modules-load.d/nvidia.conf, so systemd's own built-in
+# systemd-modules-load.service loads them automatically before
+# kata-agent.service starts -- confirmed this rootfs is systemd-based,
+# not a kata-agent-as-init one, and that ordering needs zero unit-file
+# changes) were actually assembled.
+#
+# The cloud-hypervisor/virtiofsd asset entries below are copied
+# VERBATIM from this cluster's existing "microvm" SandboxConfig as of
+# 2026-11-15 (`kubectl get sandboxconfig microvm -o yaml`) -- re-copy
+# them if that config has since changed; only kata-kernel/kata-image
+# are genuinely new here.
+#
+# To use this for a WorkerPool: set
+#   spec.sandboxClasses[0].configRef: {name: microvm-nvidia-gpu}
+# (see gnwes-counter-exclusive-workerpool.yaml.tmpl's own commented
+# example). Not yet made the default for anything -- this is an
+# explicit opt-in while this image is still being validated.
+apiVersion: ate.dev/v1
+kind: SandboxConfig
+metadata:
+  name: microvm-nvidia-gpu
+spec:
+  defaultVersion: v1
+  sandboxClass: microvm
+  versions:
+  - name: v1
+    state: Enabled
+    assets:
+      amd64:
+        cloud-hypervisor:
+          sha256: 448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc
+          url: s3://ate-snapshots/microvm-assets/amd64/448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc
+        virtiofsd:
+          sha256: 15b2e72a78cc08a9bd8a6943e89fb69c88cb3cbeb63069efceade835342ac7d4
+          url: s3://ate-snapshots/microvm-assets/amd64/15b2e72a78cc08a9bd8a6943e89fb69c88cb3cbeb63069efceade835342ac7d4
+        kata-kernel:
+          sha256: c3b5598732fc3b7ae79b55588e7a475134f7c422272add4bc91f8c1967f3559a
+          url: s3://ate-snapshots/microvm-assets/amd64/c3b5598732fc3b7ae79b55588e7a475134f7c422272add4bc91f8c1967f3559a
+        kata-image:
+          sha256: 78f5f498927489659ec7e6b22242f2be3d8b45ce148ebccf772838e6f649080c
+          url: s3://ate-snapshots/microvm-assets/amd64/78f5f498927489659ec7e6b22242f2be3d8b45ce148ebccf772838e6f649080c

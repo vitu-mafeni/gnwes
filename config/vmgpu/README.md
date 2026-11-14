@@ -269,37 +269,82 @@ behind it is unit-tested (see `internal/substratebridge/kubectlate_test.go`).
     binding to the device specifically is still unconfirmed — a separate,
     narrower claim than kernel-level enumeration.)
 
-    **Checked 2026-11-15: this is fixable, and how, confirmed by reading
-    agent-substrate's own source — not yet built.** The fast, millisecond
-    hotplug binding this tier depends on only works if `nvidia.ko` is
-    already loaded in the guest kernel *before* the hot-attach happens
-    (an already-loaded driver binds to a newly-appearing matching PCI
-    device automatically and fast; installing a driver after the fact is
-    seconds-to-minutes, not milliseconds). That means a custom,
-    driver-included Kata guest kernel+rootfs, not a config change.
-    Confirmed directly from agent-substrate's own code
-    (`api/infra/k8s/ate/v1/sandboxconfig_types.go`,
-    `cmd/ate-setup/internal/steps/microvm.go`) that this is supported,
-    not blocked: `SandboxConfig` is a generic, data-driven CRD — each
-    version is just a named set of `{url, sha256}` asset pairs
-    (`kata-kernel`, `kata-image`, etc.) per architecture, with no
-    assumption baked in about where those files came from. `ate-setup`'s
-    own CLI only ever downloads the *stock* upstream Kata release and
-    checks pinned hashes against it — that's one convenience tool's own
-    rigidity, not a property of the CRD. A **second, independent**
-    `SandboxConfig` (e.g. `microvm-gpu-driver`) pointing at a custom
-    `vmlinux` (kernel built with `nvidia.ko` compiled in, matching this
-    host's exact `580.178.04` driver) and a custom `rootfs.img` (the
-    stock Kata image with the matching userspace driver bits added,
-    using Kata's own upstream `osbuilder`/`image-builder` tooling —
-    referenced directly in this repo's own extraction code's comments —
-    not a from-scratch image, so `kata-agent` stays intact) would work
-    with zero GNWES code changes: build the assets, upload them anywhere
-    the node's object-store plugin can reach, `kubectl apply` the new
-    `SandboxConfig`, and point
-    `gnwes-counter-exclusive-workerpool.yaml.tmpl`'s `configRef` at it.
-    This is real, scoped, buildable engineering work — just not yet
-    attempted in this project.
+    **Built and uploaded 2026-11-15 — a custom, driver-included Kata
+    kernel+rootfs now exist and are staged on this cluster; actor-level
+    testing is the next step.** `config/vmgpu/build-nvidia-kata-image.sh`
+    is the actual, runnable build script (not just prose) capturing every
+    step worked out live on `dcn-gpu-0`:
+    - **Considered and rejected: `kata-deploy`'s official NVIDIA GPU
+      shims** (`qemu-nvidia-gpu` and friends, installed via
+      `helm install ... -f try-kata-nvidia-gpu.values.yaml`). Real,
+      NVIDIA-maintained, driver/rootfs fully handled — but QEMU-only,
+      and they assign the GPU statically at VM creation, the same
+      bind-once limitation every other mechanism already has. That's a
+      different problem than this tier exists to solve (cloud-hypervisor
+      + live hot-attach into an already-running VM), so it would mean
+      giving up this project's actual differentiator, not shortcutting
+      the work.
+    - **Kernel**: Kata's own kernel-builder has a built-in `-g nvidia`
+      flag (`tools/packaging/kernel/build-kernel.sh`) that merges the
+      right config fragment (`CONFIG_MODULES=y`, `CONFIG_FW_LOADER=y`,
+      plus a few driver-required memory/MTRR configs — no
+      `MODULE_SIG_FORCE`, so an unsigned custom module still loads) *and*
+      automatically fetches NVIDIA's open-source kernel module source
+      (`NVIDIA/open-gpu-kernel-modules`) to build against it. That
+      source's pinned version (`versions.yaml`'s
+      `externals.nvidia.driver.version`) defaults to whatever upstream
+      last set — confirmed live this was `615.71.09`, newer than any
+      driver this host has. **NVIDIA kernel modules and userspace
+      libraries must be the exact same version** (a private, versioned
+      ioctl interface) — pin it to this host's own real driver version
+      first (`580.178.04` — confirmed as a real tag in that repo) or the
+      module builds cleanly and then fails at init. `-t cloud-hypervisor`
+      is a first-class supported hypervisor target for the same builder
+      (confirmed from the script's own validation logic) — this was
+      never QEMU-specific.
+    - **Rootfs**: NOT a from-scratch build, and NOT NVIDIA's own
+      `tools/osbuilder/rootfs-builder/nvidia` variant (that one is real
+      and maintained, but pulls a whole separate driver install via
+      NVIDIA's own apt repos and the `NVRC` custom init, built for the
+      static-assignment QEMU shims above) — simpler and more reliable
+      given this host already has the exact right driver installed:
+      took the *stock* rootfs this cluster already deploys (same
+      sha256 as the live `microvm` SandboxConfig) and added only: `kmod`
+      + `libkmod` (genuinely absent from the stock image — confirmed via
+      `ldd`/`find`, matching why `nvidia-smi` needed the same fix on the
+      Shared tier), fetched for the *guest's* exact Ubuntu release
+      (26.04 "resolute"), not the host's (22.04) — an ABI mismatch risk
+      worth being deliberate about; the 4 real `.ko` files this build
+      produced (`nvidia`, `nvidia-uvm`, `nvidia-modeset`, `nvidia-drm` —
+      `nvidia-peermem` is GPUDirect-RDMA-only, skipped); and one
+      `/etc/modules-load.d/nvidia.conf`. This rootfs turned out to be
+      **systemd-based**, not `kata-agent`-as-init (confirmed via
+      `/usr/sbin/init -> systemd`) — systemd's own built-in
+      `systemd-modules-load.service` (confirmed present and enabled,
+      `Before=sysinit.target`) loads the modules automatically before
+      `kata-agent.service` starts, needing zero init-wrapper or unit-file
+      changes at all.
+    - **A real mistake made and fixed while building this, left in
+      because it's a genuine footgun**: the kernel build's own
+      `lib/modules/<release>/` output directory contains a `build`
+      symlink back to the full kernel source tree (standard
+      `modules_install` convention, for building further out-of-tree
+      modules later) — a careless recursive directory merge follows that
+      symlink and pulls in the *entire* kernel source (100+MB) into the
+      rootfs, nearly filling the image. Copy only `kernel/` and
+      `modules.*` explicitly, never the whole directory.
+    - Both custom assets are uploaded to this cluster's real asset store
+      (`s3://ate-snapshots/microvm-assets/amd64/`, the same rustfs bucket
+      the stock assets already use) and a **second, independent**
+      `SandboxConfig` (`sandboxconfig-microvm-nvidia-gpu.yaml`) is applied
+      — the stock `microvm` config, and every other WorkerPool still
+      using it, is completely untouched.
+      Real sha256es: kernel `c3b5598732fc3b7ae79b55588e7a475134f7c422272add4bc91f8c1967f3559a`,
+      rootfs `78f5f498927489659ec7e6b22242f2be3d8b45ce148ebccf772838e6f649080c`.
+    - **Not yet done**: actually pointing a worker pool's `configRef` at
+      it, resuming an actor onto a freshly-created (not reused) pod, and
+      checking the console log for real `nvidia.ko` binding evidence —
+      the next real-hardware step.
   - Detach found and fixed two real bugs in
     `VMGPUAttachmentReconciler.reconcileDetach`: Agent Substrate's actor
     `suspend` fully tears down the microVM's whole working directory (not
