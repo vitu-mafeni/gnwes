@@ -153,6 +153,11 @@ func TestRemoveDevice_Returns204(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)
 		w.WriteHeader(http.StatusNoContent)
 	})
+	mux.HandleFunc("/api/v1/vm.info", func(w http.ResponseWriter, r *http.Request) {
+		// The device is already gone from the VM's config by the time
+		// RemoveDevice's own confirmation poll checks -- the common case.
+		_ = json.NewEncoder(w).Encode(VMInfo{})
+	})
 	sock := newTestServer(t, mux)
 
 	c := NewClient(sock)
@@ -161,6 +166,61 @@ func TestRemoveDevice_Returns204(t *testing.T) {
 	}
 	if gotBody.ID != "gnwes-gpu-0" {
 		t.Errorf("server received id %q, want %q", gotBody.ID, "gnwes-gpu-0")
+	}
+}
+
+// TestRemoveDevice_PollsVMInfoUntilDeviceGone covers the real bug found live
+// (2026-11-14): a successful vm.remove-device response does not reliably
+// mean cloud-hypervisor has actually finished removing the device from its
+// own bookkeeping yet. RemoveDevice must keep polling vm.info rather than
+// trusting the PUT's status code alone.
+func TestRemoveDevice_PollsVMInfoUntilDeviceGone(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/vm.remove-device", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	var infoCalls int
+	mux.HandleFunc("/api/v1/vm.info", func(w http.ResponseWriter, r *http.Request) {
+		infoCalls++
+		info := VMInfo{}
+		if infoCalls < 3 {
+			// Still present for the first two polls, simulating
+			// cloud-hypervisor's own async cleanup still in flight.
+			info.Config.Devices = []DeviceConfig{{ID: "gnwes-gpu-0", Path: "/sys/bus/pci/devices/0000:01:00.0/"}}
+		}
+		_ = json.NewEncoder(w).Encode(info)
+	})
+	sock := newTestServer(t, mux)
+
+	c := NewClient(sock)
+	if err := c.RemoveDevice(context.Background(), "gnwes-gpu-0"); err != nil {
+		t.Fatalf("RemoveDevice: %v", err)
+	}
+	if infoCalls < 3 {
+		t.Errorf("expected RemoveDevice to poll vm.info at least 3 times, got %d", infoCalls)
+	}
+}
+
+// TestRemoveDevice_ErrorsIfNeverGone is the regression guard for the other
+// direction: RemoveDevice must NOT report success (letting a caller
+// release the device back to a pool for immediate reuse) while vm.info
+// still lists it, no matter how long it waits. (Kept short: Windows unix
+// sockets cap the path length, and t.TempDir() embeds the test name.)
+func TestRemoveDevice_ErrorsIfNeverGone(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/vm.remove-device", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/api/v1/vm.info", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(VMInfo{Config: VMConfig{
+			Devices: []DeviceConfig{{ID: "gnwes-gpu-0", Path: "/sys/bus/pci/devices/0000:01:00.0/"}},
+		}})
+	})
+	sock := newTestServer(t, mux)
+
+	c := NewClient(sock)
+	if err := c.RemoveDevice(context.Background(), "gnwes-gpu-0"); err == nil {
+		t.Fatal("expected an error when the device never disappears from vm.info, got nil")
 	}
 }
 

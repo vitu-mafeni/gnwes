@@ -73,6 +73,28 @@ func (s *server) addDevice(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"id": d.ID, "bdf": d.BDF})
 }
 
+// info serves GET /api/v1/vm.info, specifically its config.devices list --
+// chclient.Client.RemoveDevice now polls this after a successful
+// vm.remove-device to confirm a device is really gone (see RemoveDevice's
+// own doc comment for the real cloud-hypervisor behavior that made this
+// necessary). fakevmm's in-memory device map is always immediately
+// consistent, so this never actually makes RemoveDevice poll more than
+// once here -- it exists so fakevmm keeps serving every endpoint
+// chclient's real transport now calls, not to reproduce the real async
+// cleanup delay.
+func (s *server) info(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	devices := make([]map[string]string, 0, len(s.devices))
+	for _, d := range s.devices {
+		devices = append(devices, map[string]string{"id": d.ID, "path": d.Path})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"config": map[string]any{"devices": devices},
+	})
+}
+
 func (s *server) removeDevice(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID string `json:"id"`
@@ -117,6 +139,7 @@ func main() {
 	mux.HandleFunc("/api/v1/vmm.ping", s.ping)
 	mux.HandleFunc("/api/v1/vm.add-device", s.addDevice)
 	mux.HandleFunc("/api/v1/vm.remove-device", s.removeDevice)
+	mux.HandleFunc("/api/v1/vm.info", s.info)
 
 	log.Printf("fakevmm serving on unix socket %s", *socketPath)
 	log.Fatal(http.Serve(l, mux))

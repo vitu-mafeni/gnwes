@@ -145,13 +145,87 @@ func (c *Client) AddDevice(ctx context.Context, cfg DeviceConfig) (PciDeviceInfo
 	return info, nil
 }
 
+// VMConfig is the "config" field of GET /api/v1/vm.info's response. Only
+// Devices is modeled; cloud-hypervisor's real config carries much more
+// (cpus, memory, net, fs, ...), and encoding/json silently ignores the
+// rest.
+type VMConfig struct {
+	Devices []DeviceConfig `json:"devices"`
+}
+
+// VMInfo is the response body of GET /api/v1/vm.info.
+type VMInfo struct {
+	Config VMConfig `json:"config"`
+}
+
+// Info reports the VMM's current view of the VM, including which VFIO
+// devices its config still lists -- confirmed live (2026-11-14) as the
+// authoritative way to tell whether a device is *actually* gone, as
+// opposed to RemoveDevice's own HTTP response alone (see its doc comment).
+func (c *Client) Info(ctx context.Context) (VMInfo, error) {
+	var info VMInfo
+	err := c.getJSON(ctx, "/api/v1/vm.info", &info)
+	return info, err
+}
+
+// removeConfirmRetries/removeConfirmDelay bound how long RemoveDevice polls
+// vm.info to confirm a device is actually gone after a successful
+// vm.remove-device call -- see RemoveDevice's doc comment for why this
+// exists. 40 * 50ms = 2s, comfortably above every detach latency observed
+// live so far (124ms, 854ms).
+const (
+	removeConfirmRetries = 40
+	removeConfirmDelay   = 50 * time.Millisecond
+)
+
 // RemoveDevice hot-detaches the device previously added under id (the ID
 // given to AddDevice, or the one it returned if none was given).
+//
+// Confirmed live (2026-11-14): a successful (200) vm.remove-device response
+// does not reliably mean the device is actually gone from cloud-hypervisor's
+// own bookkeeping yet -- a real repeated attach/detach/attach cycle hit
+// "Duplicated device path" on the very next vm.add-device against the same
+// still-running VM, immediately after vm.remove-device had already reported
+// success for that exact path. Cloud-hypervisor's own device manager
+// apparently completes some of a hot-remove's internal cleanup
+// asynchronously (plausibly the guest-side ACPI unplug handshake) after its
+// HTTP response returns. RemoveDevice now polls vm.info after the PUT
+// succeeds and only returns nil once id no longer appears in
+// VMInfo.Config.Devices, so a caller that got a nil error can trust the
+// device is genuinely free to re-add -- rather than trusting the PUT's own
+// status code, which this finding shows is not sufficient on its own.
 func (c *Client) RemoveDevice(ctx context.Context, id string) error {
-	_, err := c.putJSON(ctx, "/api/v1/vm.remove-device", struct {
+	if _, err := c.putJSON(ctx, "/api/v1/vm.remove-device", struct {
 		ID string `json:"id"`
-	}{ID: id}, nil)
-	return err
+	}{ID: id}, nil); err != nil {
+		return err
+	}
+
+	for attempt := 0; ; attempt++ {
+		info, err := c.Info(ctx)
+		if err != nil {
+			return fmt.Errorf("confirming device %q was removed: %w", id, err)
+		}
+		stillPresent := false
+		for _, d := range info.Config.Devices {
+			if d.ID == id {
+				stillPresent = true
+				break
+			}
+		}
+		if !stillPresent {
+			return nil
+		}
+		if attempt == removeConfirmRetries {
+			return fmt.Errorf("device %q still present in vm.info's config.devices %v after vm.remove-device reported success (waited %s)",
+				id, info.Config.Devices, time.Duration(removeConfirmRetries)*removeConfirmDelay)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(removeConfirmDelay):
+		}
+	}
 }
 
 // dialRetries/dialRetryDelay bound how many times a request is retried
