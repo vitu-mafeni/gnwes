@@ -5,21 +5,34 @@
 This machine has **3 physical GPUs**. They're split into two groups that
 work completely differently, on purpose:
 
-- **2 of them are "shared."** Several small jobs can use one of these
+- **2 of them (`af:00.0`, `d8:00.0`) are "shared."** They stay on the
+  GPU's normal driver the whole time, which is exactly why the host's
+  own `nvidia-smi` lists them. Several small jobs can use one of these
   GPUs at the same time, each getting a slice of it (a fraction of its
-  memory and compute power) — like splitting a pizza. This is the
+  memory and compute power) — like splitting a pizza, except the
+  "knife" is a software layer that loads into every job automatically
+  and enforces the limit (not a hardware boundary — a real break-out
+  test against it hasn't been done yet, see Limitations). This is the
   **Shared tier**, built on this cluster's real Volcano scheduler.
-  Confirmed live: 3 actors ran at once, 2 of them genuinely sharing the
+  Confirmed live: 3 jobs ran at once, 2 of them genuinely sharing the
   same physical card, each one able to see and prove it only has its own
-  small slice (`nvidia-smi` inside shows `0MiB / 768MiB`, not the full
-  24576 MiB).
-- **1 of them is "exclusive."** It's handed entirely to one virtual
-  machine at a time — no sharing, no slicing, the VM gets the real whole
-  card as if it were plugged directly into it. This is the **Exclusive
-  tier**. The special part: that GPU can be unplugged from one VM and
-  plugged into a *different* VM while that second VM is already
-  running, without rebooting anything — confirmed working, repeatedly
-  (5 out of 5 cycles in the latest test).
+  small slice (`nvidia-smi` run *inside* one shows `0MiB / 768MiB`, not
+  the full 24576 MiB). A job's slice is handed out once, when it starts
+  — there's no "moving" a slice later.
+- **1 of them (`18:00.*`) is "exclusive."** It's handed entirely to one
+  virtual machine at a time — no sharing, no slicing, the VM gets the
+  real whole card with real hardware-level isolation, the same as if it
+  were plugged directly into that one machine and no other. This is the
+  **Exclusive tier**. The special part: that GPU can be unplugged from
+  one VM and plugged into a *different* VM while that second VM is
+  already running, without rebooting anything — confirmed working,
+  repeatedly (5 out of 5 cycles in the latest test). A job here never
+  gets just a slice — it's the whole card or nothing.
+- **These two groups never overlap.** A job is either Shared (gets a
+  slice of one of the 2 shared cards, software-enforced) or Exclusive
+  (gets the one dedicated card, whole, hardware-isolated) — never a mix,
+  and the 3 physical GPUs are permanently split between the two groups,
+  not reassigned between them.
 - **This is exactly why that 3rd GPU never shows up when you type
   `nvidia-smi` on the host machine itself, and that's not a bug.**
   Giving a virtual machine true, direct hardware access (the technique
