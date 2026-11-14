@@ -1,0 +1,51 @@
+# The Volcano-vGPU-sliced counterpart to gnwes-counter-workerpool.yaml.tmpl:
+# requests a real fractional slice of a physical GPU (volcano.sh/vgpu-number/
+# -memory/-cores) instead of a whole nvidia.com/gpu device, via the two
+# opt-in pod labels podgate-webhook's volcanoVGPUPatches matches on
+# (cmd/podgate-webhook/main.go) -- confirmed live (2026-11-15) against this
+# project's own real Volcano vGPU deployment on dcn-gpu-0 (Volcano scheduler,
+# volcano-vgpu-device-plugin, the nvidia-legacy CRI-O runtime handler).
+#
+# gnwes.io/vgpu-memory-units is in this cluster's configured gpuMemoryFactor
+# units (64 MiB each on dcn-gpu-0, confirmed via its real allocatable
+# volcano.sh/vgpu-memory: 768 = 2 physical 24576 MiB GPUs / 64) -- NOT raw
+# MiB. 12 units here = 768 MiB, a small slice deliberately chosen so several
+# of these pods can share one physical card concurrently. gnwes.io/vgpu-cores
+# is a 0-100 percent share of one physical GPU's compute; 30 here lets up to
+# ~3 such pods share a card's compute without oversubscribing it.
+#
+# Deliberately NOT requesting nvidia.com/gpu here (unlike
+# gnwes-counter-workerpool.yaml.tmpl) -- that resource and
+# volcano.sh/vgpu-number/-memory/-cores are two different, mutually
+# exclusive ways of getting a GPU on this cluster's two sharing strategies;
+# requesting both at once would just waste a whole second GPU allocation.
+#
+# See gnwes-counter-workerpool.yaml.tmpl's own comments for everything else
+# (workerImage resolution, spec.template.labels vs. metadata.labels).
+apiVersion: ate.dev/v1
+kind: WorkerPool
+metadata:
+  name: gnwes-counter-vgpu
+  namespace: ate-demo-counter
+  labels:
+    workload: gnwes-counter-vgpu
+spec:
+  # 3, matching gnwes-counter-vgpu-pool.yaml's poolSize -- the actual
+  # sharing test needs 3 concurrent worker pods (one actor each), not one
+  # worker pod reused sequentially.
+  replicas: 3
+  workerImage: ko://go.ate.dev/substrate/cmd/ateworker-gvisor
+  sandboxClasses:
+  - name: gvisor
+  template:
+    labels:
+      gnwes.io/gpu-pool: gnwes-counter-vgpu-pool
+      gnwes.io/vgpu-memory-units: "12"
+      gnwes.io/vgpu-cores: "30"
+    resources:
+      limits:
+        cpu: "1"
+        memory: 1Gi
+      requests:
+        cpu: 250m
+        memory: 1Gi

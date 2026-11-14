@@ -1,0 +1,27 @@
+# GNWES's own GPUWorkerPool CR for the Volcano-vGPU demo
+# (gnwes-counter-vgpu-workerpool.yaml.tmpl). Same namespace rule as
+# gnwes-counter-pool.yaml.
+#
+# Backend=Shared: real Volcano vGPU slicing, not a simulation -- see
+# config/vmgpu/README.md's 2026-11-15 entry for how this was confirmed live
+# against the real cluster. gpuResourceName/gpuResourceQuantity describe
+# volcano.sh/vgpu-number (always "1" per pod -- the fractional sizing is in
+# the vgpu-memory-units/vgpu-cores pod labels, not here), matching what
+# podgate-webhook's volcanoVGPUPatches actually requests.
+#
+# poolSize: 3, deliberately more than 1 -- this is the actual sharing test:
+# on dcn-gpu-0, VGPU_DEVICE_SPLIT_COUNT=10 means one physical GPU supports
+# up to 10 concurrent vgpu-number slots, so 3 actors here all fit on a
+# SINGLE physical card at once (12 vgpu-memory units x 3 = 36, comfortably
+# under that one card's 384-unit share of the node's 768 total).
+apiVersion: gnwes.io/v1alpha1
+kind: GPUWorkerPool
+metadata:
+  name: gnwes-counter-vgpu-pool
+  namespace: ate-demo-counter
+spec:
+  poolSize: 3
+  backend: Shared
+  gpuModel: NVIDIA-TITAN-RTX
+  gpuResourceName: volcano.sh/vgpu-number
+  gpuResourceQuantity: "1"
