@@ -10,9 +10,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	gnwesv1alpha1 "gnwes/api/v1alpha1"
 	"gnwes/internal/chclient"
@@ -139,11 +142,23 @@ func (r *VMGPUAttachmentReconciler) reconcileAttach(ctx context.Context, att *gn
 	}
 
 	info, err := ch.AddDevice(ctx, chclient.DeviceConfig{
-		Path:  device.PCIPath,
-		ID:    device.ID,
-		Iommu: chclient.IommuOff,
+		Path: device.PCIPath,
+		ID:   device.ID,
 	})
 	if err != nil {
+		// Deliberately 1 retry/sec, not tighter: confirmed live (2026-11-13)
+		// that hammering a real cloud-hypervisor VMM with a failing
+		// vm.add-device call for hours (one actor's VM took thousands of
+		// attempts across this investigation, both before and after this
+		// specific device-config bug was fixed) can exhaust something in
+		// its device-manager's own PCI slot/ID bookkeeping -- a *later*,
+		// otherwise-correct add-device call on the very same VM started
+		// failing with a genuine cloud-hypervisor error ("Could not find an
+		// available device slot on the PCI bus") despite that VM's PCI bus
+		// having only ~6 of its ~32 slots in use (confirmed via vm.info).
+		// If this attachment ends up in that state, the only known fix is
+		// to resume the actor fresh (a new VM, a clean PCI bus) rather than
+		// keep retrying against the wedged one.
 		p.Release(device.ID, attachKey)
 		att.Status.Phase = gnwesv1alpha1.VMGPUPhaseFailed
 		att.Status.Message = fmt.Sprintf("vm.add-device failed for device %q: %v", device.ID, err)
@@ -238,9 +253,41 @@ func (r *VMGPUAttachmentReconciler) clearTransitions(uid types.UID) {
 	r.clearTransition(uid, gnwesv1alpha1.VMGPUDesiredDetached)
 }
 
+// ignoreStatusOnlyUpdates skips watch-triggered reconciles for an update
+// that changed only Status -- generation (bumped only by a real Spec
+// change, since this CRD has +kubebuilder:subresource:status) is unchanged
+// and the object isn't newly entering/leaving deletion. Without this,
+// *every* Status().Update() this reconciler makes (including the Failed
+// phase/message it writes on every failed retry -- see reconcileAttach)
+// fires its own watch event and gets added back to the queue immediately
+// via the controller's plain (non-rate-limited) watch-event path, racing
+// ahead of and effectively erasing the RequeueAfter/backoff those retry
+// paths asked for. Confirmed live (2026-11-13): with no predicate, this
+// object's own resourceVersion was climbing ~20-30/sec -- a tight
+// self-sustaining loop around one Reconcile call, not the real retry
+// cadence (RequeueAfter: time.Second on a failed vm.add-device) the code
+// actually intends, and frequent enough to produce concurrent Get+Update
+// pairs from overlapping reconciles, which is what the recurring "the
+// object has been modified" conflict errors in cmd/manager's log turned
+// out to be. DeletionTimestamp is checked separately because setting it
+// (a finalized object's `kubectl delete`) is a metadata-only change that,
+// like a status update, never bumps generation either -- a plain
+// GenerationChangedPredicate would have silently broken the
+// deletion/finalizer-cleanup path in Reconcile above.
+func ignoreStatusOnlyUpdates() predicate.Predicate {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			if e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() {
+				return true
+			}
+			return e.ObjectOld.GetDeletionTimestamp().IsZero() != e.ObjectNew.GetDeletionTimestamp().IsZero()
+		},
+	}
+}
+
 func (r *VMGPUAttachmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&gnwesv1alpha1.VMGPUAttachment{}).
+		For(&gnwesv1alpha1.VMGPUAttachment{}, builder.WithPredicates(ignoreStatusOnlyUpdates())).
 		Named("vmgpuattachment").
 		Complete(r)
 }
