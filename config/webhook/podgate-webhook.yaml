@@ -23,6 +23,20 @@ spec:
       containers:
       - name: webhook
         image: localhost:5001/gnwes-podgate-webhook:latest
+        env:
+        # The image cmd/substrate-gpu-bridge/Dockerfile builds. Only read
+        # when a pod carries gnwes.io/gpu-backend=Exclusive (Backend=Shared
+        # pods never get a sidecar injected, so this is harmless to leave at
+        # its default on a cluster with no Exclusive-tier pools at all).
+        - name: BRIDGE_IMAGE
+          value: localhost:5001/substrate-gpu-bridge:latest
+        # Hardware/BIOS-topology-specific: the IOMMU group(s) the
+        # cluster's vfio-pci-bound GPU(s) land in, discovered per node via
+        #   for d in /sys/bus/pci/devices/<BDF>.*; do readlink -f $d/iommu_group; done
+        # Confirmed 8 for dcn-gpu-0's GPU (all four 0000:18:00.* PCI
+        # functions) on 2026-11-14. Comma-separate multiple groups.
+        - name: VFIO_IOMMU_GROUPS
+          value: "8"
         ports:
         - containerPort: 8443
         readinessProbe:
