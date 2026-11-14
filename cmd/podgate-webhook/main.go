@@ -152,9 +152,16 @@ func handleMutate(w http.ResponseWriter, r *http.Request, bridgeImage, bridgeIma
 	if err := json.Unmarshal(review.Request.Object.Raw, &pod); err == nil {
 		var patches []map[string]any
 
-		if _, needsGating := pod.Labels[labelPoolRef]; needsGating && !hasGate(&pod) {
-			patches = append(patches, jsonPatch("add", "/spec/schedulingGates", []map[string]string{{"name": gateName}}))
-			log.Printf("gating pod %s/%s (label %s=%s)", pod.Namespace, pod.Name, labelPoolRef, pod.Labels[labelPoolRef])
+		if _, needsGating := pod.Labels[labelPoolRef]; needsGating {
+			if !hasGate(&pod) {
+				patches = append(patches, jsonPatch("add", "/spec/schedulingGates", []map[string]string{{"name": gateName}}))
+				log.Printf("gating pod %s/%s (label %s=%s)", pod.Namespace, pod.Name, labelPoolRef, pod.Labels[labelPoolRef])
+			}
+			if visPatches, err := gpuVisibilityPatches(&pod); err != nil {
+				log.Printf("not injecting GPU visibility env vars for pod %s/%s: %v", pod.Namespace, pod.Name, err)
+			} else {
+				patches = append(patches, visPatches...)
+			}
 		}
 
 		if pod.Labels[labelBackend] == backendExclusive {
@@ -193,6 +200,64 @@ func podNameEnvVar() corev1.EnvVar {
 	return corev1.EnvVar{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}}
 }
 
+// findWorkerContainerIndex returns the index of pod's "worker" container
+// (see workerContainerName's doc comment), or an error if none exists.
+func findWorkerContainerIndex(pod *corev1.Pod) (int, error) {
+	for i, c := range pod.Spec.Containers {
+		if c.Name == workerContainerName {
+			return i, nil
+		}
+	}
+	return -1, fmt.Errorf("no container named %q found in pod spec", workerContainerName)
+}
+
+// gpuVisibilityEnvVars are the Downward-API env vars that let an actor's
+// own code discover which GPU pool it belongs to, without needing a
+// separate API call just to learn that much. Confirmed live (2026-11-15)
+// as the fix for a real, concrete gap: nothing previously told an actor
+// which pool it was in, even though its own pod's ServiceAccount already
+// has (once granted -- see config/webhook/bridge-rbac.yaml) RBAC read
+// access to that pool's real-time status (GPUWorkerPool.status /
+// VFIOGPUPool.status). With GNWES_GPU_POOL in hand, an actor's own
+// in-cluster Kubernetes client (every pod already mounts its own
+// ServiceAccount token) can GET that object directly and read real
+// total/available counts -- there was previously no way for an actor to
+// learn even the pool's name, let alone its capacity.
+func gpuVisibilityEnvVars() []corev1.EnvVar {
+	return []corev1.EnvVar{
+		{Name: "GNWES_GPU_POOL", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+			FieldPath: fmt.Sprintf("metadata.labels['%s']", labelPoolRef),
+		}}},
+		{Name: "GNWES_GPU_BACKEND", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+			FieldPath: fmt.Sprintf("metadata.labels['%s']", labelBackend),
+		}}},
+	}
+}
+
+// gpuVisibilityPatches injects gpuVisibilityEnvVars into the "worker"
+// container of any GNWES-gated pod, Shared or Exclusive tier alike --
+// unlike exclusiveSidecarPatches, this applies regardless of backend,
+// since both tiers need the same pool-name/backend self-discovery.
+func gpuVisibilityPatches(pod *corev1.Pod) ([]map[string]any, error) {
+	workerIdx, err := findWorkerContainerIndex(pod)
+	if err != nil {
+		return nil, err
+	}
+
+	envPath := fmt.Sprintf("/spec/containers/%d/env", workerIdx)
+	envExists := len(pod.Spec.Containers[workerIdx].Env) > 0
+	var patches []map[string]any
+	for _, e := range gpuVisibilityEnvVars() {
+		if envExists {
+			patches = append(patches, jsonPatch("add", envPath+"/-", e))
+		} else {
+			patches = append(patches, jsonPatch("add", envPath, []corev1.EnvVar{e}))
+			envExists = true
+		}
+	}
+	return patches, nil
+}
+
 // generateVCVMID returns a short random token identifying this one pod's
 // host-side api-socket subdirectory -- deliberately NOT the pod's own name
 // (see substratebridge.HostAPISocketPath's doc comment for why: the real
@@ -223,15 +288,9 @@ func generateVCVMID() (string, error) {
 // Downward API for its real name and this same literal vcVMID for the
 // socket path, for whichever actor Substrate currently assigns to it.
 func exclusiveSidecarPatches(pod *corev1.Pod, atespace, bridgeImage, bridgeImagePullPolicy string, vfioIOMMUGroups []string) ([]map[string]any, error) {
-	workerIdx := -1
-	for i, c := range pod.Spec.Containers {
-		if c.Name == workerContainerName {
-			workerIdx = i
-			break
-		}
-	}
-	if workerIdx == -1 {
-		return nil, fmt.Errorf("no container named %q found in pod spec", workerContainerName)
+	workerIdx, err := findWorkerContainerIndex(pod)
+	if err != nil {
+		return nil, err
 	}
 
 	vcVMID, err := generateVCVMID()

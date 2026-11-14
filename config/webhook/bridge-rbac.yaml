@@ -29,6 +29,18 @@ rules:
 - apiGroups: ["gnwes.io"]
   resources: ["vmgpuattachments"]
   verbs: ["get", "patch"]
+# Read-only, for the actor's own GPU-visibility: this ServiceAccount is
+# shared by the whole worker pod (bridge sidecar, worker, and actor
+# container alike -- see podgate-webhook's GNWES_GPU_POOL/GNWES_GPU_BACKEND
+# env vars, cmd/podgate-webhook/main.go's gpuVisibilityEnvVars), so an
+# actor's own code can use its own mounted ServiceAccount token to GET
+# the GPUWorkerPool/GPULease/VFIOGPUPool named by GNWES_GPU_POOL directly,
+# and read real total/available counts off its status -- confirmed
+# missing the hard way (2026-11-15): before this, nothing let an actor
+# see even its own pool's name, let alone real-time capacity.
+- apiGroups: ["gnwes.io"]
+  resources: ["gpuworkerpools", "gpuleases", "vfiogpupools"]
+  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

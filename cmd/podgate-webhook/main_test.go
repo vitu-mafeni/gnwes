@@ -89,6 +89,61 @@ func TestHandleMutate_GatesSharedTierPod(t *testing.T) {
 	if len(got.Spec.Containers) != 1 {
 		t.Fatalf("expected no sidecar for a Shared-tier pod, got %d containers", len(got.Spec.Containers))
 	}
+	// Both tiers get the GPU-visibility env vars, not just Exclusive.
+	assertGPUVisibilityEnv(t, got.Spec.Containers[0].Env)
+}
+
+// assertGPUVisibilityEnv checks that env carries exactly the two
+// Downward-API env vars gpuVisibilityPatches injects, pointed at the
+// right pod labels.
+func assertGPUVisibilityEnv(t *testing.T, env []corev1.EnvVar) {
+	t.Helper()
+	want := map[string]string{
+		"GNWES_GPU_POOL":    "metadata.labels['" + labelPoolRef + "']",
+		"GNWES_GPU_BACKEND": "metadata.labels['" + labelBackend + "']",
+	}
+	got := map[string]string{}
+	for _, e := range env {
+		if e.ValueFrom != nil && e.ValueFrom.FieldRef != nil {
+			got[e.Name] = e.ValueFrom.FieldRef.FieldPath
+		}
+	}
+	for name, fieldPath := range want {
+		if got[name] != fieldPath {
+			t.Errorf("env %s fieldPath = %q, want %q (env: %+v)", name, got[name], fieldPath, env)
+		}
+	}
+}
+
+func TestHandleMutate_NoGPUPoolLabelSkipsVisibilityEnv(t *testing.T) {
+	pod := workerPod(nil)
+	got := postReview(t, pod, "unused:latest")
+
+	if len(got.Spec.Containers[0].Env) != 0 {
+		t.Errorf("expected no GPU-visibility env vars on a pod with no %s label, got %+v", labelPoolRef, got.Spec.Containers[0].Env)
+	}
+}
+
+func TestGPUVisibilityPatches_AppendsToExistingEnv(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+		{Name: workerContainerName, Env: []corev1.EnvVar{{Name: "EXISTING_ENV", Value: "x"}}},
+	}}}
+	patches, err := gpuVisibilityPatches(pod)
+	if err != nil {
+		t.Fatalf("gpuVisibilityPatches: %v", err)
+	}
+	for _, p := range patches {
+		if path, _ := p["path"].(string); path == "/spec/containers/0/env" {
+			t.Errorf("expected an append path (trailing /-) when env already exists, got op on %q", path)
+		}
+	}
+}
+
+func TestGPUVisibilityPatches_ErrorsWithNoWorkerContainer(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "not-worker"}}}}
+	if _, err := gpuVisibilityPatches(pod); err == nil {
+		t.Fatal("expected an error when no container is named \"worker\"")
+	}
 }
 
 func TestHandleMutate_InjectsBridgeSidecarForExclusiveTier(t *testing.T) {
@@ -171,10 +226,13 @@ func TestHandleMutate_InjectsBridgeSidecarForExclusiveTier(t *testing.T) {
 
 	// The worker container no longer carries a POD_NAME env var -- its
 	// volumeMount's SubPath is now the literal vcVMID above, not
-	// $(POD_NAME), so there is nothing left for it to resolve.
-	if len(worker.Env) != 0 {
-		t.Errorf("expected the worker container to carry no env vars, got %+v", worker.Env)
+	// $(POD_NAME), so there is nothing left for it to resolve. It does now
+	// carry the GPU-visibility env vars (gpuVisibilityPatches), injected
+	// for every GNWES-gated pod regardless of tier.
+	if len(worker.Env) != 2 {
+		t.Fatalf("worker container env = %+v, want exactly 2 (GNWES_GPU_POOL + GNWES_GPU_BACKEND)", worker.Env)
 	}
+	assertGPUVisibilityEnv(t, worker.Env)
 
 	wantArgs := map[string]bool{
 		"-kubectl-ate-bin=/usr/local/bin/kubectl-ate": true,
