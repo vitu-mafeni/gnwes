@@ -53,7 +53,7 @@ func postReview(t *testing.T, pod *corev1.Pod, bridgeImage string, vfioIOMMUGrou
 
 	req := httptest.NewRequest(http.MethodPost, "/mutate", bytes.NewReader(reviewRaw))
 	rw := httptest.NewRecorder()
-	handleMutate(rw, req, bridgeImage, "", vfioIOMMUGroups, defaultVGPUSchedulerName, defaultVGPURuntimeClassName)
+	handleMutate(rw, req, bridgeImage, "", vfioIOMMUGroups, defaultVGPUSchedulerName, defaultVGPURuntimeClassName, nil)
 
 	var gotReview admissionv1.AdmissionReview
 	if err := json.Unmarshal(rw.Body.Bytes(), &gotReview); err != nil {
@@ -163,7 +163,7 @@ func TestHandleMutate_RespectsOverriddenVGPUSchedulerAndRuntimeClassNames(t *tes
 
 	req := httptest.NewRequest(http.MethodPost, "/mutate", bytes.NewReader(reviewRaw))
 	rw := httptest.NewRecorder()
-	handleMutate(rw, req, "unused:latest", "", nil, "custom-scheduler", "custom-runtime-class")
+	handleMutate(rw, req, "unused:latest", "", nil, "custom-scheduler", "custom-runtime-class", nil)
 
 	var gotReview admissionv1.AdmissionReview
 	if err := json.Unmarshal(rw.Body.Bytes(), &gotReview); err != nil {
@@ -352,6 +352,100 @@ func TestVolcanoVGPUPatches_CreatesResourcesWhenAbsent(t *testing.T) {
 	}
 	if len(patched.Spec.Containers[0].Resources.Limits) != 3 {
 		t.Errorf("Limits = %v, want exactly the 3 vgpu keys", patched.Spec.Containers[0].Resources.Limits)
+	}
+}
+
+func TestVGPUDebugMountPatches_EmptyListReturnsNilNil(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: workerContainerName}}}}
+	patches, err := vgpuDebugMountPatches(pod, nil)
+	if err != nil || patches != nil {
+		t.Fatalf("got patches=%v err=%v, want nil, nil for an empty host path list", patches, err)
+	}
+}
+
+func TestVGPUDebugMountPatches_MountsEveryPathReadOnlyAtTheSamePath(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: workerContainerName}}}}
+	hostPaths := []string{"/usr/bin/nvidia-smi", "/lib64/ld-linux-x86-64.so.2", "/lib/x86_64-linux-gnu/libc.so.6"}
+	patches, err := vgpuDebugMountPatches(pod, hostPaths)
+	if err != nil {
+		t.Fatalf("vgpuDebugMountPatches: %v", err)
+	}
+	patched, err := applyPatches(t, pod, patches)
+	if err != nil {
+		t.Fatalf("applying patches: %v", err)
+	}
+	if len(patched.Spec.Volumes) != len(hostPaths) {
+		t.Fatalf("got %d volumes, want %d", len(patched.Spec.Volumes), len(hostPaths))
+	}
+	mounts := patched.Spec.Containers[0].VolumeMounts
+	if len(mounts) != len(hostPaths) {
+		t.Fatalf("got %d volumeMounts, want %d", len(mounts), len(hostPaths))
+	}
+	for i, hostPath := range hostPaths {
+		if patched.Spec.Volumes[i].HostPath == nil || patched.Spec.Volumes[i].HostPath.Path != hostPath {
+			t.Errorf("volume %d = %+v, want hostPath %q", i, patched.Spec.Volumes[i], hostPath)
+		}
+		if mounts[i].MountPath != hostPath {
+			t.Errorf("mount %d MountPath = %q, want %q (host path == container path)", i, mounts[i].MountPath, hostPath)
+		}
+		if !mounts[i].ReadOnly {
+			t.Errorf("mount %d for %q is not ReadOnly", i, hostPath)
+		}
+	}
+}
+
+func TestHandleMutate_InjectsVGPUDebugMountsOnlyForVGPUSlicedPods(t *testing.T) {
+	debugMounts := []string{"/usr/bin/nvidia-smi"}
+	postReviewWithDebugMounts := func(pod *corev1.Pod) *corev1.Pod {
+		t.Helper()
+		podRaw, err := json.Marshal(pod)
+		if err != nil {
+			t.Fatalf("marshal pod: %v", err)
+		}
+		review := admissionv1.AdmissionReview{
+			TypeMeta: metav1.TypeMeta{APIVersion: "admission.k8s.io/v1", Kind: "AdmissionReview"},
+			Request:  &admissionv1.AdmissionRequest{UID: types.UID("test-uid"), Object: runtime.RawExtension{Raw: podRaw}},
+		}
+		reviewRaw, err := json.Marshal(review)
+		if err != nil {
+			t.Fatalf("marshal review: %v", err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/mutate", bytes.NewReader(reviewRaw))
+		rw := httptest.NewRecorder()
+		handleMutate(rw, req, "unused:latest", "", nil, defaultVGPUSchedulerName, defaultVGPURuntimeClassName, debugMounts)
+		var gotReview admissionv1.AdmissionReview
+		if err := json.Unmarshal(rw.Body.Bytes(), &gotReview); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+		var patches []map[string]any
+		if gotReview.Response.Patch != nil {
+			if err := json.Unmarshal(gotReview.Response.Patch, &patches); err != nil {
+				t.Fatalf("unmarshal patches: %v", err)
+			}
+		}
+		got, err := applyPatches(t, pod, patches)
+		if err != nil {
+			t.Fatalf("applying patches: %v", err)
+		}
+		return got
+	}
+
+	vgpuPod := workerPod(map[string]string{labelPoolRef: "pool-a", labelVGPUMemoryUnits: "12", labelVGPUCores: "30"})
+	got := postReviewWithDebugMounts(vgpuPod)
+	found := false
+	for _, v := range got.Spec.Volumes {
+		if v.HostPath != nil && v.HostPath.Path == "/usr/bin/nvidia-smi" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected an nvidia-smi debug mount on a vGPU-sliced pod, got volumes: %+v", got.Spec.Volumes)
+	}
+
+	wholeGPUPod := workerPod(map[string]string{labelPoolRef: "pool-a"})
+	got = postReviewWithDebugMounts(wholeGPUPod)
+	if len(got.Spec.Volumes) != 0 {
+		t.Errorf("expected no debug mounts on a pod that did not request a vGPU slice, got volumes: %+v", got.Spec.Volumes)
 	}
 }
 

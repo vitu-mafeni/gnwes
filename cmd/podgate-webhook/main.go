@@ -114,6 +114,10 @@ const (
 	resourceVGPUNumber = "volcano.sh/vgpu-number"
 	resourceVGPUMemory = "volcano.sh/vgpu-memory"
 	resourceVGPUCores  = "volcano.sh/vgpu-cores"
+
+	// vgpuDebugVolumeNamePrefix names each per-path hostPath volume
+	// vgpuDebugMountPatches creates -- see its own doc comment.
+	vgpuDebugVolumeNamePrefix = "gnwes-vgpu-debug-"
 )
 
 var codecs = serializer.NewCodecFactory(runtime.NewScheme())
@@ -151,9 +155,18 @@ func main() {
 	vgpuSchedulerName := envOr("VGPU_SCHEDULER_NAME", defaultVGPUSchedulerName)
 	vgpuRuntimeClassName := envOr("VGPU_RUNTIME_CLASS_NAME", defaultVGPURuntimeClassName)
 
+	// vgpuDebugHostMounts is host-filesystem-layout-specific (which distro,
+	// which libc, where the vendor puts its driver tools), exactly like
+	// vfioIOMMUGroups above, so it's an env var with NO default rather than
+	// a guess baked in as a constant -- see vgpuDebugMountPatches's own doc
+	// comment for what to put here and why. Empty by default: a cluster
+	// that hasn't set this just never gets the extra mounts, same as
+	// VFIO_IOMMU_GROUPS.
+	vgpuDebugHostMounts := parseCommaList(envOr("VGPU_DEBUG_HOST_MOUNTS", ""))
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mutate", func(w http.ResponseWriter, r *http.Request) {
-		handleMutate(w, r, bridgeImage, bridgeImagePullPolicy, vfioIOMMUGroups, vgpuSchedulerName, vgpuRuntimeClassName)
+		handleMutate(w, r, bridgeImage, bridgeImagePullPolicy, vfioIOMMUGroups, vgpuSchedulerName, vgpuRuntimeClassName, vgpuDebugHostMounts)
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
@@ -162,7 +175,7 @@ func main() {
 	log.Fatal(srv.ListenAndServeTLS(certFile, keyFile))
 }
 
-func handleMutate(w http.ResponseWriter, r *http.Request, bridgeImage, bridgeImagePullPolicy string, vfioIOMMUGroups []string, vgpuSchedulerName, vgpuRuntimeClassName string) {
+func handleMutate(w http.ResponseWriter, r *http.Request, bridgeImage, bridgeImagePullPolicy string, vfioIOMMUGroups []string, vgpuSchedulerName, vgpuRuntimeClassName string, vgpuDebugHostMounts []string) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -203,6 +216,12 @@ func handleMutate(w http.ResponseWriter, r *http.Request, bridgeImage, bridgeIma
 				extraEnv = vgpuDisableEnvVars()
 				log.Printf("requesting a Volcano vGPU slice for pod %s/%s (%s=%s, %s=%s)",
 					pod.Namespace, pod.Name, labelVGPUMemoryUnits, pod.Labels[labelVGPUMemoryUnits], labelVGPUCores, pod.Labels[labelVGPUCores])
+
+				if debugPatches, err := vgpuDebugMountPatches(&pod, vgpuDebugHostMounts); err != nil {
+					log.Printf("not injecting vGPU debug-tool mounts for pod %s/%s: %v", pod.Namespace, pod.Name, err)
+				} else {
+					patches = append(patches, debugPatches...)
+				}
 			}
 
 			if envPatches, err := workerEnvPatches(&pod, extraEnv...); err != nil {
@@ -412,6 +431,82 @@ func volcanoVGPUPatches(pod *corev1.Pod, vgpuSchedulerName, vgpuRuntimeClassName
 		}
 	}
 
+	return patches, nil
+}
+
+// vgpuDebugMountPatches bind-mounts a configurable list of host paths
+// (each at the identical container path, read-only -- the same
+// host-path-equals-container-path convention devVFIOPath already uses)
+// into a Shared-tier worker container that just requested a real Volcano
+// vGPU slice, so tools like nvidia-smi can actually run inside it.
+//
+// Confirmed live (2026-11-15), root-caused via crictl inspect + reading
+// a container's own /dev and /lib through /proc/<pid>/root on the host
+// (no in-container shell needed): this project's own vgpu-device-plugin
+// already bind-mounts the real NVIDIA driver library stack
+// (libnvidia-ml.so.1, libcuda.so.1, etc., matching the host's driver
+// version) into the worker container, and real /dev/nvidia* device
+// nodes ARE present and accessible -- GPU access itself already works.
+// The ONLY missing piece is glibc (libc.so.6, ld-linux-x86-64.so.2, and a
+// handful of other .so's) and the nvidia-smi binary itself: Agent
+// Substrate's ateworker-gvisor image is a statically-linked Go binary
+// with no userspace libraries of its own at all (confirmed: no shell, no
+// coreutils, no libc anywhere in the image), so nothing in that image
+// could run a dynamically-linked tool even once the driver's own
+// libraries are already mounted in.
+//
+// Deliberately NOT a list of hardcoded paths: which libc, and where the
+// distro puts it (glibc's multiarch path varies, musl is laid out
+// differently again), is a property of the HOST, not of GNWES -- same
+// reasoning as vfioIOMMUGroups. An operator enables this by setting
+// VGPU_DEBUG_HOST_MOUNTS to nvidia-smi's own real path plus every path
+// `ldd $(which nvidia-smi)` lists (see config/webhook/podgate-webhook.yaml
+// for this project's own real, confirmed list on dcn-gpu-0). Returns
+// nil, nil (not an error) when the list is empty -- the common case,
+// since most clusters have no reason to debug inside the sandbox at all.
+func vgpuDebugMountPatches(pod *corev1.Pod, hostPaths []string) ([]map[string]any, error) {
+	if len(hostPaths) == 0 {
+		return nil, nil
+	}
+
+	workerIdx, err := findWorkerContainerIndex(pod)
+	if err != nil {
+		return nil, err
+	}
+
+	// Fresh tracking, not shared with exclusiveSidecarPatches's own
+	// volumesExist/mountsExist -- safe because a pod is never both
+	// Backend=Exclusive and carrying the vGPU labels that lead here (see
+	// volcanoVGPUPatches's own doc comment), so the two functions never
+	// run against the same pod.
+	volumesExist := len(pod.Spec.Volumes) > 0
+	mountsExist := len(pod.Spec.Containers[workerIdx].VolumeMounts) > 0
+	mountsPath := fmt.Sprintf("/spec/containers/%d/volumeMounts", workerIdx)
+
+	var patches []map[string]any
+	for i, hostPath := range hostPaths {
+		volName := fmt.Sprintf("%s%d", vgpuDebugVolumeNamePrefix, i)
+		v := corev1.Volume{
+			Name: volName,
+			VolumeSource: corev1.VolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{Path: hostPath, Type: hostPathTypePtr(corev1.HostPathFile)},
+			},
+		}
+		if volumesExist {
+			patches = append(patches, jsonPatch("add", "/spec/volumes/-", v))
+		} else {
+			patches = append(patches, jsonPatch("add", "/spec/volumes", []corev1.Volume{v}))
+			volumesExist = true
+		}
+
+		m := corev1.VolumeMount{Name: volName, MountPath: hostPath, ReadOnly: true}
+		if mountsExist {
+			patches = append(patches, jsonPatch("add", mountsPath+"/-", m))
+		} else {
+			patches = append(patches, jsonPatch("add", mountsPath, []corev1.VolumeMount{m}))
+			mountsExist = true
+		}
+	}
 	return patches, nil
 }
 

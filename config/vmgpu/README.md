@@ -328,13 +328,53 @@ behind it is unit-tested (see `internal/substratebridge/kubectlate_test.go`).
     while the third named the node's other physical GPU
     (`GPU-ed7db115-...`) — two independent actors genuinely sharing one
     physical TITAN RTX, each with its own slice, confirmed by the device
-    plugin's own bookkeeping, not inferred. `kubectl exec ... nvidia-smi`
-    inside a pod was attempted but isn't possible: `ateworker-gvisor`'s
-    image is a minimal static binary with no shell or coreutils at all
-    (not even `ls`/`env`), so there's nothing to exec into — a different
-    reason than the Exclusive-tier Kata guest's lack of exec access, but
-    the same practical limitation. The pod-annotation check above is the
-    verification method that doesn't need in-container exec.
+    plugin's own bookkeeping, not inferred.
+
+    **Corrected 2026-11-15, same day:** `kubectl exec ... nvidia-smi`
+    inside a pod does fail (`ateworker-gvisor`'s image has no shell or
+    coreutils at all, not even `ls`/`env`, so there's nothing to exec
+    into), but this is NOT the same limitation as the Exclusive-tier Kata
+    guest's lack of exec access, and it's fixable, not fundamental —
+    root-caused via `crictl inspect` plus reading the container's own
+    `/dev` and `/lib` through `/proc/<pid>/root` on the host (no
+    in-container shell needed, so no guessing required):
+    - GPU access itself already works. The vgpu-device-plugin's own
+      `Allocate()` response injects real limits invisible to `kubectl`
+      (`NVIDIA_VISIBLE_DEVICES`, `CUDA_DEVICE_MEMORY_LIMIT_0=768m`,
+      `CUDA_DEVICE_SM_LIMIT=30`), an LD_PRELOAD hijack library
+      (`/etc/ld.so.preload` → `libvgpu.so`, so every process gets it
+      automatically, no env var needed), and the real NVIDIA driver
+      userspace library stack (`libcuda.so.1`, `libnvidia-ml.so.1`, etc.,
+      matching the host's 580.178.04 driver). Real `/dev/nvidia0`,
+      `nvidiactl`, `nvidia-uvm`, `nvidia-uvm-tools` device nodes are
+      present and accessible inside the container (confirmed via `ls
+      -la /proc/<pid>/root/dev/` on the host) even though they don't
+      appear in the OCI runtime spec's own `linux.devices` field — some
+      other CRI-O/plugin mechanism injects them that this project hasn't
+      fully traced, but their presence is directly confirmed, not
+      assumed.
+    - The ONLY missing piece: `ateworker-gvisor` is a statically-linked
+      Go binary with no userspace libraries of its own at all (confirmed:
+      no libc anywhere in the image, consistent with `ls`/`env` being
+      completely absent) — so even with the driver libraries already
+      mounted in, nothing in that image could run a dynamically-linked
+      tool like `nvidia-smi` without glibc (`libc.so.6`,
+      `ld-linux-x86-64.so.2`, and a handful of others) and the binary
+      itself.
+    - **Fixed**: `podgate-webhook`'s new `vgpuDebugMountPatches`
+      (`cmd/podgate-webhook/main.go`) bind-mounts a configurable list of
+      host paths (read-only, host path == container path, the same
+      convention `devVFIOPath` already uses) into any pod that requested
+      a real Volcano vGPU slice, via `VGPU_DEBUG_HOST_MOUNTS`. Not
+      hardcoded paths in Go — which libc, and where the distro puts it,
+      is a property of the *host*, not of GNWES (same reasoning as
+      `VFIO_IOMMU_GROUPS`) — an operator sets it to `nvidia-smi`'s own
+      path plus everything `ldd $(which nvidia-smi)` lists on their own
+      node. See `config/webhook/podgate-webhook.yaml` for this project's
+      own real, confirmed list on `dcn-gpu-0`. Not yet verified that
+      `nvidia-smi` actually runs end-to-end once mounted in (the next
+      real-hardware step); the pod-annotation check above remains the
+      verification method that needs no in-container exec at all.
   **What IS now done (2026-11-13):** `ateworker-microvm` turned out to
   already exist and ship upstream in agent-substrate (Kata on
   cloud-hypervisor, confirmed via `pkg/sandboxclass.All()` and
