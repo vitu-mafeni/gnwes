@@ -96,7 +96,7 @@ func TestAddDevice_HotAdd_Returns200WithPciDeviceInfo(t *testing.T) {
 	sock := newTestServer(t, mux)
 
 	c := NewClient(sock)
-	cfg := DeviceConfig{Path: "/sys/bus/pci/devices/0000:01:00.0/", ID: "gnwes-gpu-0", Iommu: IommuOff}
+	cfg := DeviceConfig{Path: "/sys/bus/pci/devices/0000:01:00.0/", ID: "gnwes-gpu-0"}
 	info, err := c.AddDevice(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("AddDevice: %v", err)

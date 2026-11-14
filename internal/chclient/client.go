@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -97,27 +98,25 @@ func (c *Client) WaitReady(ctx context.Context, deadline time.Duration) (VMMInfo
 	}
 }
 
-// IommuType is the virtual IOMMU a hotplugged device is attached to; "Off"
-// (cloud-hypervisor's default) is what a plain VFIO passthrough device
-// normally uses.
-type IommuType string
-
-const (
-	IommuOff    IommuType = "Off"
-	IommuVirtio IommuType = "Virtio"
-	IommuSmmuv3 IommuType = "Smmuv3"
-)
-
 // DeviceConfig is the request body of PUT /api/v1/vm.add-device. Path is the
 // VFIO device's sysfs path (e.g. "/sys/bus/pci/devices/0000:01:00.0/"); ID,
 // if set, is the identifier used later to remove it -- leave it empty to let
 // cloud-hypervisor assign one, but then its own response (or a subsequent
 // vm.info) is the only way to learn what it picked, so callers that need to
-// remove the device later should normally set ID themselves.
+// remove the device later should normally set ID themselves. Iommu is
+// whether the device sits behind a virtual IOMMU -- a plain JSON boolean in
+// cloud-hypervisor's real vm-config::DeviceConfig, not the string enum this
+// field used to be typed as. Confirmed the hard way (2026-11-13): sending
+// {"iommu":"Off"} got a real 400 back from a live cloud-hypervisor VMM --
+// "invalid type: string \"Off\", expected a boolean" -- once every earlier
+// dial/socket-path bug blocking AddDevice from ever reaching the VMM at all
+// was fixed. False (a plain VFIO passthrough device, no virtual IOMMU) is
+// cloud-hypervisor's own default, so omitempty dropping it is equivalent to
+// sending it explicitly.
 type DeviceConfig struct {
-	Path  string    `json:"path,omitempty"`
-	Iommu IommuType `json:"iommu,omitempty"`
-	ID    string    `json:"id,omitempty"`
+	Path  string `json:"path,omitempty"`
+	Iommu bool   `json:"iommu,omitempty"`
+	ID    string `json:"id,omitempty"`
 }
 
 // PciDeviceInfo is the 200-OK response body of a hot (VM already running)
@@ -155,13 +154,62 @@ func (c *Client) RemoveDevice(ctx context.Context, id string) error {
 	return err
 }
 
+// dialRetries/dialRetryDelay bound how many times a request is retried
+// when it fails at the dial step itself (before any bytes reach the VMM).
+// Confirmed live (2026-11-13): this exact client's dial against a real,
+// continuously up cloud-hypervisor api-socket intermittently fails with
+// "connect: no such file or directory" -- a measured success rate as low
+// as ~1-in-8 across repeated back-to-back attempts -- even though the
+// identical socket, at the same instant, was reliably reachable from
+// independent processes (curl --unix-socket, a standalone binary built on
+// this same package) and a preceding successful call on the very same
+// Client did not reliably prevent the next one from hitting it either. The
+// underlying cause was not pinned down (the socket's existence,
+// permissions, and the VMM behind it were all independently verified
+// stable throughout), so this retries the dial itself a few times, cheaply
+// and only when the failure is dial-level, rather than masking it with a
+// guess about the root cause. It never retries after a request has
+// actually reached the VMM (a real HTTP response, even an error one, is
+// returned as-is) -- vm.add-device's retried callers must not risk
+// invoking its real, possibly-mutating request body twice.
+const (
+	dialRetries    = 8
+	dialRetryDelay = 15 * time.Millisecond
+)
+
+// isDialFailure reports whether err is a failure to establish the
+// connection itself, as opposed to a timeout/cancellation or any error
+// that implies a request actually reached the far side.
+func isDialFailure(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
+}
+
+// doWithDialRetry issues the request built by newReq, retrying (rebuilding
+// a fresh request each time) only while the failure is dial-level -- see
+// dialRetries.
+func (c *Client) doWithDialRetry(newReq func() (*http.Request, error)) (*http.Response, error) {
+	for attempt := 0; ; attempt++ {
+		req, err := newReq()
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.http.Do(req)
+		if err == nil {
+			return resp, nil
+		}
+		if !isDialFailure(err) || attempt == dialRetries {
+			return nil, err
+		}
+		time.Sleep(dialRetryDelay)
+	}
+}
+
 // getJSON issues a GET and decodes the 2xx JSON response into out.
 func (c *Client) getJSON(ctx context.Context, path string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiBase+path, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := c.http.Do(req)
+	resp, err := c.doWithDialRetry(func() (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, http.MethodGet, apiBase+path, nil)
+	})
 	if err != nil {
 		return err
 	}
@@ -185,12 +233,14 @@ func (c *Client) putJSON(ctx context.Context, path string, body, out any) (hadBo
 	if err != nil {
 		return false, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, apiBase+path, bytes.NewReader(b))
-	if err != nil {
-		return false, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.http.Do(req)
+	resp, err := c.doWithDialRetry(func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, apiBase+path, bytes.NewReader(b))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	})
 	if err != nil {
 		return false, err
 	}

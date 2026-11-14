@@ -48,7 +48,7 @@ func (s *server) ping(w http.ResponseWriter, r *http.Request) {
 func (s *server) addDevice(w http.ResponseWriter, r *http.Request) {
 	var cfg struct {
 		Path  string `json:"path"`
-		Iommu string `json:"iommu"`
+		Iommu bool   `json:"iommu"`
 		ID    string `json:"id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
