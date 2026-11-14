@@ -1,5 +1,45 @@
 # VMGPUAttachment — real, live GPU hot-attach/detach (not simulated)
 
+## In plain English (updated 2026-11-15)
+
+This machine has **3 physical GPUs**. They're split into two groups that
+work completely differently, on purpose:
+
+- **2 of them are "shared."** Several small jobs can use one of these
+  GPUs at the same time, each getting a slice of it (a fraction of its
+  memory and compute power) — like splitting a pizza. This is the
+  **Shared tier**, built on this cluster's real Volcano scheduler.
+  Confirmed live: 3 actors ran at once, 2 of them genuinely sharing the
+  same physical card, each one able to see and prove it only has its own
+  small slice (`nvidia-smi` inside shows `0MiB / 768MiB`, not the full
+  24576 MiB).
+- **1 of them is "exclusive."** It's handed entirely to one virtual
+  machine at a time — no sharing, no slicing, the VM gets the real whole
+  card as if it were plugged directly into it. This is the **Exclusive
+  tier**. The special part: that GPU can be unplugged from one VM and
+  plugged into a *different* VM while that second VM is already
+  running, without rebooting anything — confirmed working, repeatedly
+  (5 out of 5 cycles in the latest test).
+- **This is exactly why that 3rd GPU never shows up when you type
+  `nvidia-smi` on the host machine itself, and that's not a bug.**
+  Giving a virtual machine true, direct hardware access (the technique
+  is called VFIO passthrough) requires the host's own GPU driver to
+  never touch that card at all — it's handed over at boot time to a
+  different, lower-level mechanism instead. So the "missing" GPU
+  *is* the one being used — it's just invisible to the host on
+  purpose, the whole time, regardless of whether a VM is currently
+  using it or not. Confirmed directly on real hardware: that GPU's PCI
+  driver stays the same (`vfio-pci`) before and after a VM lets go of
+  it; only `kubectl get vmgpuattachment` and `kubectl get vfiogpupool`
+  can tell you whether it's currently in use.
+- **Is this reproducible?** The code for both mechanisms, the real bug
+  fixes found along the way, and the exact commands to repeat every
+  test are all committed to this repo (see `REPRODUCTION-GUIDE.md`) —
+  nothing was hand-patched outside of version control. A handful of
+  one-time, per-machine setup steps (labeling the GPU node, installing
+  a CRI-O config file, loading kernel modules) are still manual, not
+  automated yet — documented honestly as that, not glossed over.
+
 This is GPULease's real counterpart: where GPULease simulates the attach
 step (`time.Sleep` + a pod annotation) because vanilla Kubernetes DRA cannot
 attach a device to a pod after it's already running (see
