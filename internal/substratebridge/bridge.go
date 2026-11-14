@@ -20,10 +20,17 @@ package substratebridge
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	gnwesv1alpha1 "gnwes/api/v1alpha1"
 )
+
+// osStat is swapped out in tests so HostAPISocketPath's filesystem check
+// is testable without real files on disk -- the same interface-injection
+// approach this package already uses for ActorStateFetcher/
+// AttachmentDriver.
+var osStat = os.Stat
 
 // ActorObservation is what this bridge needs to know about whichever actor
 // (if any) currently occupies the one worker pod it watches. A worker pod
@@ -76,34 +83,48 @@ type AttachmentDriver interface {
 // VM-on-bare-host version of this test).
 const GNWESHostVCVMDir = "/var/lib/gnwes/vcvm"
 
-// clhAPISocketName is the cloud-hypervisor api-socket's filename within
-// one actor's kata.VMDir -- NOT "clh-api.sock", despite that being the
-// name agent-substrate's cmd/ateworker-microvm/run.go:514 uses for a
-// *fresh* VMM launched by a cold `run` (no prior checkpoint). Every
-// `kubectl-ate resume`, including an actor's very first one, goes through
-// restore.go's restoreWorkload instead (confirmed live: the worker log
-// shows "Actor restoring"/"restoring guest memory" even for a brand-new
-// actor's first resume -- apparently Substrate always restores from a
-// baseline/golden snapshot rather than maintaining a separate cold-start
-// VMM path), and restore.go:393 launches that VMM with
-// "clh-api-restore.sock" instead, permanently (restore.go:527 stores that
-// same path for the VM's whole subsequent lifetime -- it is never renamed
-// to clh-api.sock afterward). Confirmed the hard way (2026-11-13): after
-// fixing the AF_UNIX path-length bug below, vm.add-device still failed,
-// now with "no such file or directory" -- `clh-api.sock` genuinely never
-// existed in the VMDir, while `clh-api-restore.sock` was sitting right
-// there the whole time. Since this project's bridge only ever observes
-// actors through resume/suspend cycles, never a cold `run`, this is the
-// one name that actually applies in practice.
-const clhAPISocketName = "clh-api-restore.sock"
+// clhAPISocketNameRestore/clhAPISocketNameFresh are the two possible
+// cloud-hypervisor api-socket filenames within one actor's kata.VMDir,
+// which one actually applies depending on how ateworker-microvm launched
+// THIS SPECIFIC VM -- not a universal constant, corrected 2026-11-15.
+//
+// The original version of this comment (2026-11-13) concluded Substrate
+// "always restores from a baseline/golden snapshot" and that
+// "clh-api.sock" never applies in practice, because every resume tested
+// until then reused a worker pod that already held its own prior local
+// checkpoint -- restore.go's restoreWorkload ran every time, naming the
+// socket "clh-api-restore.sock" permanently (restore.go:393/527).
+//
+// That "always" was disproven live (2026-11-15): deleting a worker pod
+// (forcing Substrate to recreate it from scratch -- e.g. to pick up a
+// new SandboxConfig) and then resuming an actor onto the fresh pod made
+// ateworker-microvm cold-`run` the VM instead (run.go:514,
+// "clh-api.sock") -- even though that SAME actor had prior checkpoint
+// history from its life on the old pod. The deciding factor is whether
+// THIS WORKER POD has its own local checkpoint to restore from, not
+// whether the actor has ever run before.
+const (
+	clhAPISocketNameRestore = "clh-api-restore.sock"
+	clhAPISocketNameFresh   = "clh-api.sock"
+)
 
 // HostAPISocketPath returns the HOST-filesystem path to one actor's real
 // cloud-hypervisor api-socket -- NOT the in-pod path ateworker-microvm
-// itself writes to (/run/vc/vm/<actor-uid>/clh-api-restore.sock, see
-// clhAPISocketName above). Because podgate-webhook hostPath-mounts
+// itself writes to (/run/vc/vm/<actor-uid>/<clh-api(-restore)?.sock>, see
+// the two names above). Because podgate-webhook hostPath-mounts
 // GNWESHostVCVMDir/<vcVMID> onto that exact container path, the same file
 // is reachable from the host (and hence by cmd/manager) at this path
 // instead.
+//
+// Checks which of the two names this specific VM actually created,
+// rather than assuming one unconditionally (the 2026-11-13 bug) --
+// preferring clhAPISocketNameRestore if, improbably, both somehow exist.
+// Returns "" (not an error) if NEITHER exists yet: the normal case for a
+// brief window right after resume, before cloud-hypervisor has created
+// its socket at all -- ReconcileOnce already treats an empty APISocket as
+// "leave the attachment's last-known socket alone" (see its own doc
+// comment), so returning the old hardcoded assumption here instead would
+// silently reintroduce this exact bug for every cold `run` launch.
 //
 // vcVMID is a short random token podgate-webhook generates once per pod at
 // admission time (cmd/podgate-webhook's exclusiveSidecarPatches) -- NOT the
@@ -125,7 +146,14 @@ const clhAPISocketName = "clh-api-restore.sock"
 // pod's VM is torn down and rebuilt fresh for each actor that resumes onto
 // it.
 func HostAPISocketPath(vcVMID, actorUID string) string {
-	return fmt.Sprintf("%s/%s/%s/%s", GNWESHostVCVMDir, vcVMID, actorUID, clhAPISocketName)
+	base := fmt.Sprintf("%s/%s/%s", GNWESHostVCVMDir, vcVMID, actorUID)
+	for _, name := range []string{clhAPISocketNameRestore, clhAPISocketNameFresh} {
+		p := base + "/" + name
+		if _, err := osStat(p); err == nil {
+			return p
+		}
+	}
+	return ""
 }
 
 // DesiredStateForActorState maps a Substrate ActorState onto what
