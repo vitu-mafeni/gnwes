@@ -277,13 +277,64 @@ behind it is unit-tested (see `internal/substratebridge/kubectlate_test.go`).
     here installs or configures HAMi — so today both tiers give out
     whole, exclusive GPUs, differing in *when* (pod creation only vs. any
     time) and *how* (Kubernetes scheduling vs. live VFIO hot-attach), not
-    in sharing. Real GPU slicing is a real next step, not something
-    built yet. Relatedly: no real concurrent multi-actor GPU workload has
-    ever been run on either tier — the one real-hardware DRA+CDI test was
-    a single pod, once, and `cmd/loadtest`'s pods use a plain `pause`
-    image with no GPU resource request at all, so it only exercises
-    GNWES's own admission bookkeeping, never real device binding under
-    concurrency.
+    in sharing. **Superseded 2026-11-15 for the Shared tier — see below:**
+    real GPU slicing on the Shared tier is now built and confirmed live,
+    via this project's real cluster stack (Volcano + its own
+    `volcano-vgpu-device-plugin`), not HAMi. Real concurrent multi-actor
+    sharing has also now been run and confirmed on real hardware (see
+    below) — superseding the "no real concurrent multi-actor GPU workload
+    has ever been run" claim this bullet originally made. The Exclusive
+    tier is unaffected by any of this: VFIO hot-attach still gives out a
+    whole physical GPU per claim, which is correct for that tier (it
+    exists specifically for workloads that need a whole device).
+  - **Built and confirmed live 2026-11-15: real Volcano vGPU slicing for
+    the Shared tier**, matching this project's actual real-cluster
+    GitOps config (GPU Operator + `volcano-vgpu-device-plugin` HelmRelease
+    + Volcano scheduler HelmRelease + the `nvidia-legacy` CRI-O runtime
+    handler DaemonSet — NOT generic upstream Project-HAMi, which an
+    earlier version of this doc incorrectly assumed before the real
+    configs were provided). `podgate-webhook`'s `volcanoVGPUPatches` (see
+    `cmd/podgate-webhook/main.go`) turns two new opt-in pod labels,
+    `gnwes.io/vgpu-memory-units` and `gnwes.io/vgpu-cores`, into
+    `schedulerName: volcano`, `runtimeClassName: nvidia-legacy`, and the
+    three `volcano.sh/vgpu-number`/`-memory`/`-cores` container resource
+    keys (preserving any existing `cpu`/`memory` limits/requests — see the
+    function's own doc comment on why this and `workerEnvPatches` must
+    each do their JSON-patch "does this path already exist" check in one
+    shared pass, not two independent ones, or the second function's patch
+    can clobber the first's). `vgpuDisableEnvVars` also injects
+    `NVIDIA_GDS`/`NVIDIA_GDRCOPY`/`NVIDIA_MOFED=disabled`, required by the
+    real plugin's NVML-hijack library or it breaks the driver mount —
+    taken directly from `ui-ml-platform-postgres`'s own
+    `api/gpu/gpu_backend.py` (`container_env()`), the real platform this
+    project's cluster is modeled on.
+
+    **Verified end-to-end on real hardware (2026-11-15):** a new demo
+    (`config/substrate-integration/gnwes-counter-vgpu-{pool.yaml,
+    workerpool.yaml.tmpl,template.yaml.tmpl}`) requests a small slice (12
+    `vgpu-memory` units = 768 MiB, 30 `vgpu-cores` = 30% compute) across 3
+    replicas, deliberately more than 1 so real sharing — not sequential
+    reuse — gets exercised. All 3 actors (`gnwes-actor-vgpu-1/2/3`)
+    reached `ACTOR_STATE_RUNNING`, each on its own worker pod on
+    `dcn-gpu-0`, each pod showing `schedulerName: volcano`,
+    `runtimeClassName: nvidia-legacy`, the correct combined resources and
+    env vars, and the node's real `kubectl describe node` "Allocated
+    resources" summing all 3 pods' requests exactly
+    (`vgpu-number: 3`, `vgpu-memory: 36`, `vgpu-cores: 90`). The clinching
+    proof of *real* physical-GPU co-residency, not just scheduler-level
+    accounting: two of the three pods' `volcano.sh/vgpu-ids-new`
+    annotations (stamped by the device plugin itself) named the exact
+    same physical GPU UUID (`GPU-80e6777e-9d74-f660-8247-d0ffc309f3c0`),
+    while the third named the node's other physical GPU
+    (`GPU-ed7db115-...`) — two independent actors genuinely sharing one
+    physical TITAN RTX, each with its own slice, confirmed by the device
+    plugin's own bookkeeping, not inferred. `kubectl exec ... nvidia-smi`
+    inside a pod was attempted but isn't possible: `ateworker-gvisor`'s
+    image is a minimal static binary with no shell or coreutils at all
+    (not even `ls`/`env`), so there's nothing to exec into — a different
+    reason than the Exclusive-tier Kata guest's lack of exec access, but
+    the same practical limitation. The pod-annotation check above is the
+    verification method that doesn't need in-container exec.
   **What IS now done (2026-11-13):** `ateworker-microvm` turned out to
   already exist and ship upstream in agent-substrate (Kata on
   cloud-hypervisor, confirmed via `pkg/sandboxclass.All()` and

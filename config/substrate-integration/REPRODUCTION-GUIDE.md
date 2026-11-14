@@ -591,6 +591,51 @@ the real host-visible api-socket path. See "Is this real, or simulated?"
 below for exactly how far past that the real GPU hot-attach itself has
 been confirmed as of this writing.
 
+## Phase 5 — Shared tier real Volcano vGPU slicing, run for real 2026-11-15
+
+This exercises real fractional GPU *sharing* on the Shared tier — several
+actors each getting their own slice of one physical GPU concurrently, via
+this project's actual real-cluster stack (Volcano's own scheduler +
+`volcano-vgpu-device-plugin`, not generic Project-HAMi, and not the
+whole-GPU DRA/CDI path Phase 3 exercises). See `config/vmgpu/README.md`'s
+2026-11-15 entry for the full story and the exact fix in
+`podgate-webhook`'s `volcanoVGPUPatches`/`workerEnvPatches`.
+
+```bash
+# resolve the ko:// image reference the same way Phase 3/4 did, then:
+kubectl apply -f config/substrate-integration/gnwes-counter-vgpu-pool.yaml
+kubectl apply -f config/substrate-integration/gnwes-counter-vgpu-workerpool.yaml.tmpl   # after resolving workerImage
+kubectl-ate create actor-template -f config/substrate-integration/gnwes-counter-vgpu-template.yaml.tmpl   # after resolving the counter image
+
+for i in 1 2 3; do
+  kubectl-ate create actor gnwes-actor-vgpu-$i -a ate-demo-counter --template gnwes-counter-vgpu
+  kubectl-ate resume actor gnwes-actor-vgpu-$i -a ate-demo-counter
+done
+# expect: all 3 reach ACTOR_STATE_RUNNING, each on its own gnwes-counter-vgpu-* pod
+
+kubectl get pod <any-vgpu-pod> -n ate-demo-counter -o jsonpath='{.spec.schedulerName}{"\n"}{.spec.runtimeClassName}{"\n"}'
+# expect: volcano / nvidia-legacy
+
+kubectl describe node dcn-gpu-0 | grep -A5 "Allocated resources" | grep vgpu
+# expect: vgpu-number 3, vgpu-memory 36, vgpu-cores 90 (3 pods x 1/12/30)
+
+for p in <pod-1> <pod-2> <pod-3>; do
+  kubectl get pod "$p" -n ate-demo-counter -o jsonpath='{.metadata.annotations}' | tr ',' '\n' | grep vgpu-ids-new
+done
+# the proof of real co-residency: two pods' GPU UUIDs matching means those
+# two actors are genuinely sharing the same physical card
+```
+
+**Confirmed live on this cluster (2026-11-15):** all 3 actors reached
+`ACTOR_STATE_RUNNING` concurrently; two of the three pods' `vgpu-ids-new`
+annotations named the exact same physical GPU UUID, the third named the
+node's other physical GPU — real concurrent multi-actor sharing of one
+physical TITAN RTX, not three separate devices and not actors taking
+turns. `kubectl exec ... nvidia-smi` inside a pod doesn't work —
+`ateworker-gvisor`'s image has no shell/coreutils at all to exec into —
+so the annotation check above is the verification method that doesn't
+need in-container exec.
+
 ## Is this real, or simulated? Be precise about which parts
 
 **Updated 2026-11-13: the GPUWorkerPool/GPULease mock pool described in the
@@ -602,6 +647,7 @@ exist, matching GNWES's two-tier design:
 | | What it proves | GPU device | Attach mechanism |
 |---|---|---|---|
 | **`GPUWorkerPool`/`GPULease`, Backend=Shared** (used above) | Real admission-budget control (never over-schedule more GPU-requesting pods than the pool allows) layered on top of Kubernetes' own real GPU scheduling | **Real.** The pod's spec directly requests `nvidia.com/gpu` (or a HAMi virtual-slice resource); Kubernetes' own scheduler and device plugin bind it, the same as any other GPU workload | Nothing to attach — binding happens once, at pod admission. GNWES's lease just confirms and records the real node/resource once the pod reaches `Running` (`internal/controller/gpulease_controller.go`'s `bindShared`) |
+| **`GPUWorkerPool`, Backend=Shared, Volcano vGPU slicing** (Phase 5) | Real *fractional* GPU sharing — several actors each on their own slice of one physical GPU concurrently, via this project's real Volcano + `volcano-vgpu-device-plugin` stack | **Real** — verified on real hardware (2026-11-15): 3 concurrent actors, two confirmed co-resident on the exact same physical GPU via the device plugin's own `volcano.sh/vgpu-ids-new` pod annotation | Nothing to attach — same as above, binding happens once at pod admission, but the real device plugin hands out a *slice* (`volcano.sh/vgpu-number`/`-memory`/`-cores`), not the whole card — `podgate-webhook`'s `volcanoVGPUPatches` (`cmd/podgate-webhook/main.go`) |
 | **DRA + CDI** (`config/dra/README.md`) | Real Kubernetes `ResourceClaim` allocation, a real kubelet DRA plugin, real CDI injection | **Real**, verified on a real 3x NVIDIA TITAN RTX node (GPU Operator, CRI-O, CDI enabled) — `nvidia-smi` inside the test pod shows the real, exact GPU allocated | Kubernetes DRA's own allocation, at pod-creation time only — **cannot** attach to an already-running pod (a Kubernetes limitation, confirmed from `gvisor`'s own `nvproxy` source: a static, creation-time-only device registry) |
 | **`GPUWorkerPool`/`GPULease`, Backend=Exclusive** + `VFIOGPUPool`/`VMGPUAttachment` (`config/vmgpu/README.md`) | Real, live GPU hot-attach/detach into an **already-running** guest, no recreation, driven by the real actor's real resume/suspend state | **Real** — verified on real hardware (2026-11-11) against a standalone test VM, and **end-to-end through the full `ateworker-microvm`/Kubernetes path on 2026-11-14**: a real worker pod (sandboxClasses: [microvm]), a real actor resumed onto it, and a real hot-attach landing `PHASE=Attached` with a real `deviceID`/`guestBDF` (`gpu-exclusive-0` / `0000:00:08.0`) | A real `PUT /api/v1/vm.add-device` / `vm.remove-device` call against cloud-hypervisor's own REST API (`internal/chclient`), driven by flipping `spec.desiredState` — now on a `VMGPUAttachment` GNWES itself creates per real worker pod (`GPUWorkerPoolReconciler.reconcileExclusive`), flipped by `cmd/substrate-gpu-bridge` (`internal/substratebridge`) polling the real actor's real state, never by `GPULeaseReconciler` itself (see its doc comment for why two writers to that field would fight) |
 
