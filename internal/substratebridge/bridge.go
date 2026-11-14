@@ -20,17 +20,10 @@ package substratebridge
 import (
 	"context"
 	"fmt"
-	"os"
 	"time"
 
 	gnwesv1alpha1 "gnwes/api/v1alpha1"
 )
-
-// osStat is swapped out in tests so HostAPISocketPath's filesystem check
-// is testable without real files on disk -- the same interface-injection
-// approach this package already uses for ActorStateFetcher/
-// AttachmentDriver.
-var osStat = os.Stat
 
 // ActorObservation is what this bridge needs to know about whichever actor
 // (if any) currently occupies the one worker pod it watches. A worker pod
@@ -116,15 +109,23 @@ const (
 // is reachable from the host (and hence by cmd/manager) at this path
 // instead.
 //
-// Checks which of the two names this specific VM actually created,
-// rather than assuming one unconditionally (the 2026-11-13 bug) --
-// preferring clhAPISocketNameRestore if, improbably, both somehow exist.
-// Returns "" (not an error) if NEITHER exists yet: the normal case for a
-// brief window right after resume, before cloud-hypervisor has created
-// its socket at all -- ReconcileOnce already treats an empty APISocket as
-// "leave the attachment's last-known socket alone" (see its own doc
-// comment), so returning the old hardcoded assumption here instead would
-// silently reintroduce this exact bug for every cold `run` launch.
+// Deliberately a PURE function again -- an earlier version of this fix
+// (2026-11-15) tried to check which of the two names actually exists
+// right here, via os.Stat. That is architecturally impossible from
+// where this runs: KubectlAteFetcher.FetchActorState, inside
+// cmd/substrate-gpu-bridge, the worker pod's own sidecar container --
+// which was deliberately given NO hostPath mount into GNWESHostVCVMDir
+// at all (this function only ever needs to produce a path STRING for
+// cmd/manager, running separately on the host, to dial; the sidecar
+// itself never opens the socket). Confirmed live: that version always
+// saw ENOENT for both candidates regardless of what actually existed on
+// the host, so the attachment stayed permanently Detached. The real
+// fix, which actually has filesystem access to check,
+// is internal/controller/vmgpuattachment_controller.go's
+// resolveRealAPISocket -- this function goes back to always returning
+// one guess (clhAPISocketNameRestore); cmd/manager resolves which name
+// is actually real right before dialing, same place vmGone's own
+// os.Stat check already lives.
 //
 // vcVMID is a short random token podgate-webhook generates once per pod at
 // admission time (cmd/podgate-webhook's exclusiveSidecarPatches) -- NOT the
@@ -146,14 +147,7 @@ const (
 // pod's VM is torn down and rebuilt fresh for each actor that resumes onto
 // it.
 func HostAPISocketPath(vcVMID, actorUID string) string {
-	base := fmt.Sprintf("%s/%s/%s", GNWESHostVCVMDir, vcVMID, actorUID)
-	for _, name := range []string{clhAPISocketNameRestore, clhAPISocketNameFresh} {
-		p := base + "/" + name
-		if _, err := osStat(p); err == nil {
-			return p
-		}
-	}
-	return ""
+	return fmt.Sprintf("%s/%s/%s/%s", GNWESHostVCVMDir, vcVMID, actorUID, clhAPISocketNameRestore)
 }
 
 // DesiredStateForActorState maps a Substrate ActorState onto what

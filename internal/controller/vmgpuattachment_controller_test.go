@@ -541,3 +541,47 @@ func TestVMGPUAttachment_NoDeviceAvailableStaysPending(t *testing.T) {
 		t.Fatalf("Phase = %q, want Pending", got.Status.Phase)
 	}
 }
+
+// TestResolveRealAPISocket guards against the 2026-11-15 bug where
+// cmd/substrate-gpu-bridge always guessed "clh-api-restore.sock" and
+// this reconciler dialed that guess unchecked: a freshly-recreated
+// worker pod's VM (a cold `run`, no local checkpoint for that pod) is
+// actually named "clh-api.sock" instead, and the bridge has no way to
+// tell which happened (no hostPath mount to check) -- only this
+// reconciler, running on the host, can.
+func TestResolveRealAPISocket(t *testing.T) {
+	dir := t.TempDir()
+	restorePath := filepath.Join(dir, "clh-api-restore.sock")
+	freshPath := filepath.Join(dir, "clh-api.sock")
+
+	touch := func(t *testing.T, path string) {
+		t.Helper()
+		if err := os.WriteFile(path, nil, 0o644); err != nil {
+			t.Fatalf("creating %s: %v", path, err)
+		}
+	}
+
+	t.Run("bridge's guess (restore) is actually there", func(t *testing.T) {
+		d := t.TempDir()
+		p := filepath.Join(d, "clh-api-restore.sock")
+		touch(t, p)
+		if got := resolveRealAPISocket(p); got != p {
+			t.Errorf("resolveRealAPISocket(%q) = %q, want unchanged %q", p, got, p)
+		}
+	})
+
+	t.Run("bridge guessed restore but this VM is actually a fresh cold run", func(t *testing.T) {
+		touch(t, freshPath)
+		if got := resolveRealAPISocket(restorePath); got != freshPath {
+			t.Errorf("resolveRealAPISocket(%q) = %q, want the real sibling %q", restorePath, got, freshPath)
+		}
+	})
+
+	t.Run("neither candidate exists: returned unchanged, not guessed further", func(t *testing.T) {
+		d := t.TempDir()
+		p := filepath.Join(d, "clh-api-restore.sock")
+		if got := resolveRealAPISocket(p); got != p {
+			t.Errorf("resolveRealAPISocket(%q) = %q, want unchanged %q when nothing exists", p, got, p)
+		}
+	})
+}

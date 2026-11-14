@@ -3,7 +3,6 @@ package substratebridge
 import (
 	"context"
 	"fmt"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -230,40 +229,21 @@ func TestReconcileOnce_NoOpWhenStateAndSocketBothCurrent(t *testing.T) {
 	}
 }
 
-// TestHostAPISocketPath_PrefersWhicheverSocketActuallyExists guards
-// against clhAPISocketNameRestore becoming a hardcoded, unconditional
-// assumption again (as it was before 2026-11-15): a worker pod that was
-// recreated from scratch gets a cold `run` launch (clh-api.sock), not a
-// restore, even for an actor with prior checkpoint history elsewhere.
-func TestHostAPISocketPath_PrefersWhicheverSocketActuallyExists(t *testing.T) {
-	base := GNWESHostVCVMDir + "/worker-1/abc-123/"
-	restorePath := base + clhAPISocketNameRestore
-	freshPath := base + clhAPISocketNameFresh
-
-	cases := []struct {
-		name   string
-		exists map[string]bool
-		want   string
-	}{
-		{"only restore exists", map[string]bool{restorePath: true}, restorePath},
-		{"only fresh exists (the 2026-11-15 bug's real-world case)", map[string]bool{freshPath: true}, freshPath},
-		{"both exist, restore preferred", map[string]bool{restorePath: true, freshPath: true}, restorePath},
-		{"neither exists yet", nil, ""},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			orig := osStat
-			defer func() { osStat = orig }()
-			osStat = func(path string) (os.FileInfo, error) {
-				if c.exists[path] {
-					return nil, nil
-				}
-				return nil, os.ErrNotExist
-			}
-			if got := HostAPISocketPath("worker-1", "abc-123"); got != c.want {
-				t.Errorf("HostAPISocketPath(%q, %q) = %q, want %q", "worker-1", "abc-123", got, c.want)
-			}
-		})
+// TestHostAPISocketPath is deliberately back to testing a pure function
+// with no filesystem dependency -- see HostAPISocketPath's own doc
+// comment for why an earlier version of this test (which swapped a fake
+// os.Stat to assert "whichever socket name actually exists" behavior
+// implemented directly in this function) was fixed in the wrong place:
+// that check is architecturally impossible from here (this runs inside
+// the bridge sidecar, which has no mount to check at all). The real
+// fix and its own tests are
+// internal/controller/vmgpuattachment_controller.go's
+// resolveRealAPISocket.
+func TestHostAPISocketPath(t *testing.T) {
+	got := HostAPISocketPath("worker-1", "abc-123")
+	want := "/var/lib/gnwes/vcvm/worker-1/abc-123/clh-api-restore.sock"
+	if got != want {
+		t.Errorf("HostAPISocketPath(%q, %q) = %q, want %q", "worker-1", "abc-123", got, want)
 	}
 }
 
