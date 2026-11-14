@@ -88,6 +88,26 @@ const (
 	// vfio-pci-bound GPU needs opened, regardless of which IOMMU group it
 	// ends up in.
 	vfioContainerDevice = "/dev/vfio/vfio"
+
+	// labelVGPUMemoryUnits/labelVGPUCores opt a Shared-tier pod into a real
+	// Volcano vGPU slice (volcano.sh/vgpu-*) instead of the whole-physical-
+	// GPU DRA+CDI path (config/dra) -- set directly on the Substrate
+	// WorkerPool's own pod template, the same convention as gnwes.io/gpu-pool
+	// etc. Confirmed live (2026-11-15) against this project's own real
+	// deployment: Volcano scheduler + volcano-vgpu-device-plugin, with
+	// dcn-gpu-0's node allocatable actually showing volcano.sh/vgpu-number:
+	// 20, volcano.sh/vgpu-memory: 768 (2 physical GPUs x this cluster's
+	// configured deviceSplitCount=10 and gpuMemoryFactor=64 MiB/unit). See
+	// volcanoVGPUPatches.
+	labelVGPUMemoryUnits = "gnwes.io/vgpu-memory-units"
+	labelVGPUCores       = "gnwes.io/vgpu-cores"
+
+	vgpuSchedulerName    = "volcano"
+	vgpuRuntimeClassName = "nvidia-legacy"
+
+	resourceVGPUNumber = "volcano.sh/vgpu-number"
+	resourceVGPUMemory = "volcano.sh/vgpu-memory"
+	resourceVGPUCores  = "volcano.sh/vgpu-cores"
 )
 
 var codecs = serializer.NewCodecFactory(runtime.NewScheme())
@@ -157,10 +177,29 @@ func handleMutate(w http.ResponseWriter, r *http.Request, bridgeImage, bridgeIma
 				patches = append(patches, jsonPatch("add", "/spec/schedulingGates", []map[string]string{{"name": gateName}}))
 				log.Printf("gating pod %s/%s (label %s=%s)", pod.Namespace, pod.Name, labelPoolRef, pod.Labels[labelPoolRef])
 			}
-			if visPatches, err := gpuVisibilityPatches(&pod); err != nil {
-				log.Printf("not injecting GPU visibility env vars for pod %s/%s: %v", pod.Namespace, pod.Name, err)
+
+			// vgpuPatches must be computed (and, if non-empty, applied)
+			// before workerEnvPatches below: vgpuDisableEnvVars only needs
+			// adding when this pod actually opted into a vGPU slice, and
+			// workerEnvPatches is the ONE place that appends to the worker
+			// container's env array, so it must see every env var this
+			// request needs in one pass -- see workerEnvPatches's own doc
+			// comment for why two independent append-tracking passes on
+			// the same array would corrupt each other.
+			var extraEnv []corev1.EnvVar
+			if vgpuPatches, err := volcanoVGPUPatches(&pod); err != nil {
+				log.Printf("not requesting a Volcano vGPU slice for pod %s/%s: %v", pod.Namespace, pod.Name, err)
+			} else if len(vgpuPatches) > 0 {
+				patches = append(patches, vgpuPatches...)
+				extraEnv = vgpuDisableEnvVars()
+				log.Printf("requesting a Volcano vGPU slice for pod %s/%s (%s=%s, %s=%s)",
+					pod.Namespace, pod.Name, labelVGPUMemoryUnits, pod.Labels[labelVGPUMemoryUnits], labelVGPUCores, pod.Labels[labelVGPUCores])
+			}
+
+			if envPatches, err := workerEnvPatches(&pod, extraEnv...); err != nil {
+				log.Printf("not injecting worker env vars for pod %s/%s: %v", pod.Namespace, pod.Name, err)
 			} else {
-				patches = append(patches, visPatches...)
+				patches = append(patches, envPatches...)
 			}
 		}
 
@@ -234,20 +273,51 @@ func gpuVisibilityEnvVars() []corev1.EnvVar {
 	}
 }
 
-// gpuVisibilityPatches injects gpuVisibilityEnvVars into the "worker"
-// container of any GNWES-gated pod, Shared or Exclusive tier alike --
-// unlike exclusiveSidecarPatches, this applies regardless of backend,
-// since both tiers need the same pool-name/backend self-discovery.
-func gpuVisibilityPatches(pod *corev1.Pod) ([]map[string]any, error) {
+// vgpuDisableEnvVars are required on the worker container whenever it
+// requests a real Volcano vGPU slice (volcanoVGPUPatches) -- confirmed
+// against this project's own real deployment (D:\codes\ui-ml-platform-
+// postgres's api/gpu/gpu_backend.py, container_env()): the vGPU plugin's
+// own hook library preloads into every process in the container, and
+// without these set to "disabled" it can break the NVIDIA driver mount
+// entirely ("Verified with a probe pod" per that reference implementation's
+// own comment).
+func vgpuDisableEnvVars() []corev1.EnvVar {
+	return []corev1.EnvVar{
+		{Name: "NVIDIA_GDS", Value: "disabled"},
+		{Name: "NVIDIA_GDRCOPY", Value: "disabled"},
+		{Name: "NVIDIA_MOFED", Value: "disabled"},
+	}
+}
+
+// workerEnvPatches injects gpuVisibilityEnvVars (always, for any
+// GNWES-gated pod, Shared or Exclusive tier alike) plus extra (e.g.
+// vgpuDisableEnvVars, only when the pod opted into a Volcano vGPU slice)
+// into the "worker" container's env array.
+//
+// This is the ONE place that appends to that array: both env-var sources
+// must be combined into a single append-tracking pass here, not two
+// separate functions each independently checking "does env already
+// exist" -- if gpuVisibilityEnvVars's own patches ran first and decided
+// the (originally empty) array needed a whole-array "add", a second,
+// independently-tracked append for vgpuDisableEnvVars would either
+// wrongly re-issue that same whole-array "add" (overwriting what the
+// first write's patches, applied earlier in the same ordered JSON Patch
+// list, will already have put there) or wrongly assume "/-" append
+// semantics against what the ORIGINAL (pre-patch) pod spec showed, which
+// is exactly the same cross-function append-tracking hazard
+// exclusiveSidecarPatches's own volumesExist/mountsExist comments already
+// warn about for volumes/mounts.
+func workerEnvPatches(pod *corev1.Pod, extra ...corev1.EnvVar) ([]map[string]any, error) {
 	workerIdx, err := findWorkerContainerIndex(pod)
 	if err != nil {
 		return nil, err
 	}
 
+	vars := append(gpuVisibilityEnvVars(), extra...)
 	envPath := fmt.Sprintf("/spec/containers/%d/env", workerIdx)
 	envExists := len(pod.Spec.Containers[workerIdx].Env) > 0
 	var patches []map[string]any
-	for _, e := range gpuVisibilityEnvVars() {
+	for _, e := range vars {
 		if envExists {
 			patches = append(patches, jsonPatch("add", envPath+"/-", e))
 		} else {
@@ -255,6 +325,84 @@ func gpuVisibilityPatches(pod *corev1.Pod) ([]map[string]any, error) {
 			envExists = true
 		}
 	}
+	return patches, nil
+}
+
+// jsonPointerEscape escapes a string for use as one segment of a JSON
+// Pointer path (RFC 6901: "~" -> "~0" first, then "/" -> "~1" -- in that
+// order, since the "/" escape sequence itself contains a "~" that must
+// not be re-escaped). Needed for resource keys like "volcano.sh/vgpu-number",
+// which contain a literal "/".
+func jsonPointerEscape(s string) string {
+	s = strings.ReplaceAll(s, "~", "~0")
+	s = strings.ReplaceAll(s, "/", "~1")
+	return s
+}
+
+// volcanoVGPUPatches builds the JSON Patch operations that request a real
+// Volcano vGPU slice for a Shared-tier worker pod, confirmed live
+// (2026-11-15) against this project's own real Volcano deployment (see
+// labelVGPUMemoryUnits's doc comment). Opt-in via labelVGPUMemoryUnits +
+// labelVGPUCores; returns nil, nil (not an error) when neither label is
+// present -- this is the common case, every pod using the whole-physical-
+// GPU DRA+CDI path instead.
+//
+// vgpu-memory is counted in this cluster's configured gpuMemoryFactor
+// units (64 MiB each here, confirmed against dcn-gpu-0's real allocatable
+// volcano.sh/vgpu-memory: 768 = 2 physical 24576 MiB GPUs / 64), not raw
+// MiB -- labelVGPUMemoryUnits's value is passed straight through as that
+// unit count, not converted.
+func volcanoVGPUPatches(pod *corev1.Pod) ([]map[string]any, error) {
+	memUnits, hasMem := pod.Labels[labelVGPUMemoryUnits]
+	cores, hasCores := pod.Labels[labelVGPUCores]
+	if !hasMem && !hasCores {
+		return nil, nil
+	}
+	if !hasMem || !hasCores {
+		return nil, fmt.Errorf("pod carries only one of %s/%s; both are required together", labelVGPUMemoryUnits, labelVGPUCores)
+	}
+
+	workerIdx, err := findWorkerContainerIndex(pod)
+	if err != nil {
+		return nil, err
+	}
+
+	patches := []map[string]any{
+		// "add" on an existing scalar field replaces it (RFC 6902) --
+		// this pod's schedulerName is ordinarily "default-scheduler"
+		// (Kubernetes' own default, always explicitly set once the
+		// apiserver defaults it), confirmed live, not absent.
+		jsonPatch("add", "/spec/schedulerName", vgpuSchedulerName),
+		jsonPatch("add", "/spec/runtimeClassName", vgpuRuntimeClassName),
+	}
+
+	resourceValues := map[string]string{
+		resourceVGPUNumber: "1",
+		resourceVGPUMemory: memUnits,
+		resourceVGPUCores:  cores,
+	}
+	container := pod.Spec.Containers[workerIdx]
+	for _, section := range []struct {
+		name   string
+		exists bool
+	}{
+		{"limits", len(container.Resources.Limits) > 0},
+		{"requests", len(container.Resources.Requests) > 0},
+	} {
+		base := fmt.Sprintf("/spec/containers/%d/resources/%s", workerIdx, section.name)
+		if section.exists {
+			// The map already has entries (confirmed live: this project's
+			// own worker containers already carry real cpu/memory limits
+			// and requests) -- add each key individually so they're
+			// preserved, rather than overwriting the whole map.
+			for _, key := range []string{resourceVGPUNumber, resourceVGPUMemory, resourceVGPUCores} {
+				patches = append(patches, jsonPatch("add", base+"/"+jsonPointerEscape(key), resourceValues[key]))
+			}
+		} else {
+			patches = append(patches, jsonPatch("add", base, resourceValues))
+		}
+	}
+
 	return patches, nil
 }
 

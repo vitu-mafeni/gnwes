@@ -10,6 +10,7 @@ import (
 	jsonpatch "github.com/evanphx/json-patch"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -93,6 +94,48 @@ func TestHandleMutate_GatesSharedTierPod(t *testing.T) {
 	assertGPUVisibilityEnv(t, got.Spec.Containers[0].Env)
 }
 
+func TestHandleMutate_RequestsVolcanoVGPUSliceWhenLabeled(t *testing.T) {
+	pod := workerPod(map[string]string{
+		labelPoolRef:         "pool-a",
+		labelVGPUMemoryUnits: "12",
+		labelVGPUCores:       "30",
+	})
+	pod.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+		Limits:   corev1.ResourceList{"cpu": resource.MustParse("1")},
+		Requests: corev1.ResourceList{"cpu": resource.MustParse("250m")},
+	}
+	got := postReview(t, pod, "unused:latest")
+
+	if got.Spec.SchedulerName != vgpuSchedulerName {
+		t.Errorf("SchedulerName = %q, want %q", got.Spec.SchedulerName, vgpuSchedulerName)
+	}
+	if got.Spec.RuntimeClassName == nil || *got.Spec.RuntimeClassName != vgpuRuntimeClassName {
+		t.Errorf("RuntimeClassName = %v, want %q", got.Spec.RuntimeClassName, vgpuRuntimeClassName)
+	}
+	worker := got.Spec.Containers[0]
+	if worker.Resources.Limits[resourceVGPUMemory] != resource.MustParse("12") {
+		t.Errorf("Limits[%s] = %v, want 12", resourceVGPUMemory, worker.Resources.Limits[resourceVGPUMemory])
+	}
+	if worker.Resources.Limits[resourceVGPUCores] != resource.MustParse("30") {
+		t.Errorf("Limits[%s] = %v, want 30", resourceVGPUCores, worker.Resources.Limits[resourceVGPUCores])
+	}
+	// Both the always-on visibility vars and the vGPU-specific disable
+	// vars must land together in the one worker container.
+	assertGPUVisibilityEnv(t, worker.Env)
+	wantDisableVars := map[string]bool{"NVIDIA_GDS": true, "NVIDIA_GDRCOPY": true, "NVIDIA_MOFED": true}
+	found := map[string]bool{}
+	for _, e := range worker.Env {
+		if e.Value == "disabled" {
+			found[e.Name] = true
+		}
+	}
+	for name := range wantDisableVars {
+		if !found[name] {
+			t.Errorf("missing disabled env var %s, got env: %+v", name, worker.Env)
+		}
+	}
+}
+
 // assertGPUVisibilityEnv checks that env carries exactly the two
 // Downward-API env vars gpuVisibilityPatches injects, pointed at the
 // right pod labels.
@@ -124,13 +167,13 @@ func TestHandleMutate_NoGPUPoolLabelSkipsVisibilityEnv(t *testing.T) {
 	}
 }
 
-func TestGPUVisibilityPatches_AppendsToExistingEnv(t *testing.T) {
+func TestWorkerEnvPatches_AppendsToExistingEnv(t *testing.T) {
 	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
 		{Name: workerContainerName, Env: []corev1.EnvVar{{Name: "EXISTING_ENV", Value: "x"}}},
 	}}}
-	patches, err := gpuVisibilityPatches(pod)
+	patches, err := workerEnvPatches(pod)
 	if err != nil {
-		t.Fatalf("gpuVisibilityPatches: %v", err)
+		t.Fatalf("workerEnvPatches: %v", err)
 	}
 	for _, p := range patches {
 		if path, _ := p["path"].(string); path == "/spec/containers/0/env" {
@@ -139,11 +182,151 @@ func TestGPUVisibilityPatches_AppendsToExistingEnv(t *testing.T) {
 	}
 }
 
-func TestGPUVisibilityPatches_ErrorsWithNoWorkerContainer(t *testing.T) {
+func TestWorkerEnvPatches_ErrorsWithNoWorkerContainer(t *testing.T) {
 	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "not-worker"}}}}
-	if _, err := gpuVisibilityPatches(pod); err == nil {
+	if _, err := workerEnvPatches(pod); err == nil {
 		t.Fatal("expected an error when no container is named \"worker\"")
 	}
+}
+
+func TestWorkerEnvPatches_IncludesExtraVarsInOneAppendPass(t *testing.T) {
+	// Regression guard for the cross-function append-tracking hazard
+	// workerEnvPatches's own doc comment describes: gpuVisibilityEnvVars
+	// and any extra vars (e.g. vgpuDisableEnvVars) must land in ONE
+	// combined pass, not two independently-tracked ones.
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: workerContainerName}}}}
+	patches, err := workerEnvPatches(pod, vgpuDisableEnvVars()...)
+	if err != nil {
+		t.Fatalf("workerEnvPatches: %v", err)
+	}
+	// Starting from an empty env array: exactly one "add whole array" op,
+	// then append ("/-") ops for every remaining var -- never a second
+	// "add whole array" op, which would silently drop everything the
+	// first one put there.
+	wantCount := len(gpuVisibilityEnvVars()) + len(vgpuDisableEnvVars())
+	if len(patches) != wantCount {
+		t.Fatalf("got %d patches, want %d (one per env var)", len(patches), wantCount)
+	}
+	wholeArrayAdds := 0
+	for _, p := range patches {
+		if path, _ := p["path"].(string); path == "/spec/containers/0/env" {
+			wholeArrayAdds++
+		}
+	}
+	if wholeArrayAdds != 1 {
+		t.Errorf("expected exactly 1 whole-array add, got %d", wholeArrayAdds)
+	}
+}
+
+func TestVolcanoVGPUPatches_NoLabelsReturnsNilNil(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: workerContainerName}}}}
+	patches, err := volcanoVGPUPatches(pod)
+	if err != nil || patches != nil {
+		t.Fatalf("got patches=%v err=%v, want nil, nil when neither vGPU label is set", patches, err)
+	}
+}
+
+func TestVolcanoVGPUPatches_OnlyOneLabelErrors(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labelVGPUMemoryUnits: "12"}},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: workerContainerName}}},
+	}
+	if _, err := volcanoVGPUPatches(pod); err == nil {
+		t.Fatal("expected an error when only one of the two vGPU labels is set")
+	}
+}
+
+func TestVolcanoVGPUPatches_SetsSchedulerRuntimeClassAndResources(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labelVGPUMemoryUnits: "12", labelVGPUCores: "30"}},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: workerContainerName,
+			Resources: corev1.ResourceRequirements{
+				Limits:   corev1.ResourceList{"cpu": resource.MustParse("1"), "memory": resource.MustParse("1Gi")},
+				Requests: corev1.ResourceList{"cpu": resource.MustParse("250m"), "memory": resource.MustParse("1Gi")},
+			},
+		}}},
+	}
+	patches, err := volcanoVGPUPatches(pod)
+	if err != nil {
+		t.Fatalf("volcanoVGPUPatches: %v", err)
+	}
+
+	patched, err := applyPatches(t, pod, patches)
+	if err != nil {
+		t.Fatalf("applying patches: %v", err)
+	}
+	if patched.Spec.SchedulerName != vgpuSchedulerName {
+		t.Errorf("SchedulerName = %q, want %q", patched.Spec.SchedulerName, vgpuSchedulerName)
+	}
+	if patched.Spec.RuntimeClassName == nil || *patched.Spec.RuntimeClassName != vgpuRuntimeClassName {
+		t.Errorf("RuntimeClassName = %v, want %q", patched.Spec.RuntimeClassName, vgpuRuntimeClassName)
+	}
+	worker := patched.Spec.Containers[0]
+	for _, c := range []struct {
+		name string
+		list corev1.ResourceList
+	}{{"limits", worker.Resources.Limits}, {"requests", worker.Resources.Requests}} {
+		if c.list[resourceVGPUNumber] != resource.MustParse("1") {
+			t.Errorf("%s[%s] = %v, want 1", c.name, resourceVGPUNumber, c.list[resourceVGPUNumber])
+		}
+		if c.list[resourceVGPUMemory] != resource.MustParse("12") {
+			t.Errorf("%s[%s] = %v, want 12", c.name, resourceVGPUMemory, c.list[resourceVGPUMemory])
+		}
+		if c.list[resourceVGPUCores] != resource.MustParse("30") {
+			t.Errorf("%s[%s] = %v, want 30", c.name, resourceVGPUCores, c.list[resourceVGPUCores])
+		}
+		// Pre-existing keys must survive.
+		if cpu, ok := c.list["cpu"]; !ok || cpu.IsZero() {
+			t.Errorf("%s lost its pre-existing cpu entry: %v", c.name, c.list)
+		}
+	}
+}
+
+func TestVolcanoVGPUPatches_CreatesResourcesWhenAbsent(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labelVGPUMemoryUnits: "12", labelVGPUCores: "30"}},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: workerContainerName}}},
+	}
+	patches, err := volcanoVGPUPatches(pod)
+	if err != nil {
+		t.Fatalf("volcanoVGPUPatches: %v", err)
+	}
+	patched, err := applyPatches(t, pod, patches)
+	if err != nil {
+		t.Fatalf("applying patches: %v", err)
+	}
+	if len(patched.Spec.Containers[0].Resources.Limits) != 3 {
+		t.Errorf("Limits = %v, want exactly the 3 vgpu keys", patched.Spec.Containers[0].Resources.Limits)
+	}
+}
+
+// applyPatches marshals pod, applies patches as a real JSON Patch (the same
+// library postReview uses), and unmarshals the result -- an end-to-end
+// check that the patches are well-formed, not just structurally plausible.
+func applyPatches(t *testing.T, pod *corev1.Pod, patches []map[string]any) (*corev1.Pod, error) {
+	t.Helper()
+	podRaw, err := json.Marshal(pod)
+	if err != nil {
+		t.Fatalf("marshal pod: %v", err)
+	}
+	patchBytes, err := json.Marshal(patches)
+	if err != nil {
+		t.Fatalf("marshal patches: %v", err)
+	}
+	patch, err := jsonpatch.DecodePatch(patchBytes)
+	if err != nil {
+		t.Fatalf("decoding patch: %v (patch=%s)", err, patchBytes)
+	}
+	patchedRaw, err := patch.Apply(podRaw)
+	if err != nil {
+		return nil, err
+	}
+	var result corev1.Pod
+	if err := json.Unmarshal(patchedRaw, &result); err != nil {
+		t.Fatalf("unmarshal patched pod: %v", err)
+	}
+	return &result, nil
 }
 
 func TestHandleMutate_InjectsBridgeSidecarForExclusiveTier(t *testing.T) {
