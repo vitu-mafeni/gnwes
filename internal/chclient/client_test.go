@@ -141,6 +141,58 @@ func TestAddDevice_ConflictReturnsError(t *testing.T) {
 	}
 }
 
+// TestAddDevice_DuplicatePathRecoversRealBDF covers a real finding
+// (2026-11-14): cloud-hypervisor can reject vm.add-device with "Duplicated
+// device path" when the device is genuinely already attached -- including
+// on a freshly-resumed VM whose restore-from-checkpoint path baked the
+// device into its config from the start, confirmed live against a real
+// VM. AddDevice must recover the real BDF from vm.info rather than treat
+// this as a hard, permanent failure.
+func TestAddDevice_DuplicatePathRecoversRealBDF(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/vm.add-device", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"Duplicated device path: /sys/bus/pci/devices/0000:01:00.0/"}`))
+	})
+	mux.HandleFunc("/api/v1/vm.info", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(VMInfo{
+			Config:     VMConfig{Devices: []DeviceConfig{{ID: "gpu-0", Path: "/sys/bus/pci/devices/0000:01:00.0/"}}},
+			DeviceTree: map[string]DeviceTreeNode{"gpu-0": {PciBdf: "0000:00:07.0"}},
+		})
+	})
+	sock := newTestServer(t, mux)
+
+	c := NewClient(sock)
+	info, err := c.AddDevice(context.Background(), DeviceConfig{Path: "/sys/bus/pci/devices/0000:01:00.0/", ID: "gpu-0"})
+	if err != nil {
+		t.Fatalf("AddDevice: %v", err)
+	}
+	if info.ID != "gpu-0" || info.BDF != "0000:00:07.0" {
+		t.Errorf("got %+v, want ID=gpu-0 BDF=0000:00:07.0", info)
+	}
+}
+
+// TestAddDevice_DuplicatePathErrorsIfNotPresent is the regression guard: a
+// "Duplicated device path" error must NOT be treated as success unless
+// vm.info genuinely confirms the device is there. (Kept short: Windows
+// unix sockets cap the path length, and t.TempDir() embeds the test name.)
+func TestAddDevice_DuplicatePathErrorsIfNotPresent(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/vm.add-device", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"Duplicated device path: /sys/bus/pci/devices/0000:01:00.0/"}`))
+	})
+	mux.HandleFunc("/api/v1/vm.info", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(VMInfo{})
+	})
+	sock := newTestServer(t, mux)
+
+	c := NewClient(sock)
+	if _, err := c.AddDevice(context.Background(), DeviceConfig{Path: "/sys/bus/pci/devices/0000:01:00.0/", ID: "gpu-0"}); err == nil {
+		t.Fatal("expected an error when vm.info does not actually list the device, got nil")
+	}
+}
+
 func TestRemoveDevice_Returns204(t *testing.T) {
 	mux := http.NewServeMux()
 	var gotBody struct {

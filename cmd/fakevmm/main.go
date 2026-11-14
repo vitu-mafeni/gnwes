@@ -73,25 +73,29 @@ func (s *server) addDevice(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"id": d.ID, "bdf": d.BDF})
 }
 
-// info serves GET /api/v1/vm.info, specifically its config.devices list --
-// chclient.Client.RemoveDevice now polls this after a successful
-// vm.remove-device to confirm a device is really gone (see RemoveDevice's
-// own doc comment for the real cloud-hypervisor behavior that made this
+// info serves GET /api/v1/vm.info, specifically its config.devices list and
+// device_tree -- chclient.Client.RemoveDevice polls config.devices after a
+// successful vm.remove-device to confirm a device is really gone, and
+// AddDevice falls back to device_tree's pci_bdf when cloud-hypervisor
+// itself reports a device as already attached (see both functions' doc
+// comments for the real cloud-hypervisor behavior that made this
 // necessary). fakevmm's in-memory device map is always immediately
-// consistent, so this never actually makes RemoveDevice poll more than
-// once here -- it exists so fakevmm keeps serving every endpoint
-// chclient's real transport now calls, not to reproduce the real async
-// cleanup delay.
+// consistent, so RemoveDevice never actually polls more than once here --
+// this exists so fakevmm keeps serving every endpoint chclient's real
+// transport now calls, not to reproduce the real async cleanup delay.
 func (s *server) info(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	devices := make([]map[string]string, 0, len(s.devices))
+	deviceTree := make(map[string]any, len(s.devices))
 	for _, d := range s.devices {
 		devices = append(devices, map[string]string{"id": d.ID, "path": d.Path})
+		deviceTree[d.ID] = map[string]string{"id": d.ID, "pci_bdf": d.BDF}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"config": map[string]any{"devices": devices},
+		"config":      map[string]any{"devices": devices},
+		"device_tree": deviceTree,
 	})
 }
 

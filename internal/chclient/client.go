@@ -28,6 +28,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -137,12 +138,52 @@ func (c *Client) AddDevice(ctx context.Context, cfg DeviceConfig) (PciDeviceInfo
 	var info PciDeviceInfo
 	hadBody, err := c.putJSON(ctx, "/api/v1/vm.add-device", cfg, &info)
 	if err != nil {
+		if bdf, ok := c.alreadyAttached(ctx, cfg.ID, err); ok {
+			return PciDeviceInfo{ID: cfg.ID, BDF: bdf}, nil
+		}
 		return PciDeviceInfo{}, err
 	}
 	if !hadBody {
 		return PciDeviceInfo{}, nil
 	}
 	return info, nil
+}
+
+// alreadyAttached reports whether addErr is cloud-hypervisor's own
+// "Duplicated device path" validation error for id, and if the device is
+// genuinely already present (confirmed via vm.info, not trusted from the
+// error text alone), returns its real guest BDF. Confirmed live
+// (2026-11-14), two different ways: a still-running VM whose
+// vm.remove-device had reported success without cloud-hypervisor's device
+// manager actually finishing the removal yet (see RemoveDevice), and --
+// found while reproducing that same error after the fix above -- a
+// freshly-resumed VM that Agent Substrate's own restore-from-checkpoint
+// path booted with this device already baked into its config (confirmed
+// via vm.info showing it present, with a real device_tree PciBdf, on a VM
+// AddDevice had never actually been called against successfully). Either
+// way, a hard failure here would make the device permanently unattachable
+// for this actor; treating the state cloud-hypervisor itself reports as
+// the success it already is lets the reconciler record the right BDF
+// instead.
+func (c *Client) alreadyAttached(ctx context.Context, id string, addErr error) (bdf string, ok bool) {
+	if !strings.Contains(addErr.Error(), "Duplicated device path") {
+		return "", false
+	}
+	info, err := c.Info(ctx)
+	if err != nil {
+		return "", false
+	}
+	found := false
+	for _, d := range info.Config.Devices {
+		if d.ID == id {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return "", false
+	}
+	return info.DeviceTree[id].PciBdf, true
 }
 
 // VMConfig is the "config" field of GET /api/v1/vm.info's response. Only
@@ -153,9 +194,18 @@ type VMConfig struct {
 	Devices []DeviceConfig `json:"devices"`
 }
 
+// DeviceTreeNode is one entry of GET /api/v1/vm.info's "device_tree" map,
+// keyed by device ID. Only PciBdf is modeled; confirmed against a real
+// cloud-hypervisor instance's response (2026-11-14) to carry the device's
+// real guest-side PCI address once it's actually plugged in.
+type DeviceTreeNode struct {
+	PciBdf string `json:"pci_bdf"`
+}
+
 // VMInfo is the response body of GET /api/v1/vm.info.
 type VMInfo struct {
-	Config VMConfig `json:"config"`
+	Config     VMConfig                  `json:"config"`
+	DeviceTree map[string]DeviceTreeNode `json:"device_tree"`
 }
 
 // Info reports the VMM's current view of the VM, including which VFIO
