@@ -238,6 +238,52 @@ behind it is unit-tested (see `internal/substratebridge/kubectlate_test.go`).
   not just prose: **`crio-vfio-devices.conf`** in this directory. Install
   it at `/etc/crio/crio.conf.d/99999-vfio-annotations.conf` on each
   Exclusive-tier GPU node and `sudo systemctl restart crio`.
+  - **Two more real bugs found via a repeated attach/detach cycle
+    benchmark (`scripts/bench-attach-cycles.sh`), both fixed in
+    `internal/chclient/client.go` (2026-11-14):** a successful
+    `vm.remove-device` response doesn't reliably mean cloud-hypervisor has
+    actually finished removing the device internally (`RemoveDevice` now
+    polls `vm.info` and only returns once the device is confirmed gone
+    from `config.devices`); and a freshly-resumed VM can report
+    `"Duplicated device path"` on `vm.add-device` because Agent
+    Substrate's restore-from-checkpoint path boots it with the GPU
+    already baked into its config (`AddDevice` now recognizes this via
+    `vm.info` and recovers the real BDF instead of failing). A 5-cycle
+    suspend/resume run went from wedging after the first cycle to 5/5
+    clean after both fixes.
+  - **Checked 2026-11-15: an actor's own code had no way to see its GPU
+    pool, or how much capacity was available, at all — fixed.**
+    `podgate-webhook` now injects `GNWES_GPU_POOL`/`GNWES_GPU_BACKEND`
+    (Downward API, from the pod's own labels) into the `worker`
+    container of every GNWES-gated pod, Shared and Exclusive tier alike,
+    and `config/webhook/bridge-rbac.yaml`'s Role now also grants
+    read-only `get`/`list`/`watch` on `gpuworkerpools`, `gpuleases`, and
+    `vfiogpupools` to the worker pod's shared ServiceAccount — confirmed
+    live via `kubectl auth can-i ... --as=system:serviceaccount:...`, all
+    `yes`. An actor's own code can now use its own mounted ServiceAccount
+    token (the standard Kubernetes self-discovery pattern, no new API) to
+    `GET` the pool named by `GNWES_GPU_POOL` and read real total/available
+    counts off its `.status`. **Not yet confirmed from *inside* a real
+    guest** — same access limitation as the NVIDIA-driver item above (no
+    shell, no exec); this was verified from outside via RBAC checks and
+    the deployed pod's resolved env vars, not by an actor actually calling
+    the Kubernetes API itself.
+  - **Checked 2026-11-15: the Shared tier gives out a whole physical GPU
+    per claim, not a HAMi slice.** `config/dra/README.md` confirms
+    `nvidia-smi` inside the real-hardware test pod showed exactly the one
+    GPU claimed; no HAMi slicing library is deployed anywhere in this
+    project's config. `GPUWorkerPoolSpec.GPUResourceName` can in
+    principle point at a HAMi virtual-slice resource key, but nothing
+    here installs or configures HAMi — so today both tiers give out
+    whole, exclusive GPUs, differing in *when* (pod creation only vs. any
+    time) and *how* (Kubernetes scheduling vs. live VFIO hot-attach), not
+    in sharing. Real GPU slicing is a real next step, not something
+    built yet. Relatedly: no real concurrent multi-actor GPU workload has
+    ever been run on either tier — the one real-hardware DRA+CDI test was
+    a single pod, once, and `cmd/loadtest`'s pods use a plain `pause`
+    image with no GPU resource request at all, so it only exercises
+    GNWES's own admission bookkeeping, never real device binding under
+    concurrency.
   **What IS now done (2026-11-13):** `ateworker-microvm` turned out to
   already exist and ship upstream in agent-substrate (Kata on
   cloud-hypervisor, confirmed via `pkg/sandboxclass.All()` and
