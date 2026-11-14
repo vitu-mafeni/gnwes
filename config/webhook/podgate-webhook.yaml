@@ -45,24 +45,28 @@ spec:
         #   value: volcano
         # - name: VGPU_RUNTIME_CLASS_NAME
         #   value: nvidia-legacy
-        # Opt-in: bind-mounts nvidia-smi plus every shared library it
-        # needs into any pod that requests a real Volcano vGPU slice, so
-        # it can actually run there. Commented out by default -- most
-        # clusters have no reason to debug inside the sandbox, and these
-        # exact paths are this project's own dcn-gpu-0 (Ubuntu 22.04,
-        # glibc), confirmed live (2026-11-15) via
-        #   which nvidia-smi && ldd "$(which nvidia-smi)"
-        # on a *different* host, re-run that and paste the real paths
-        # here instead of assuming these.
-        # - name: VGPU_DEBUG_HOST_MOUNTS
-        #   value: >-
-        #     /usr/bin/nvidia-smi,
-        #     /lib64/ld-linux-x86-64.so.2,
-        #     /lib/x86_64-linux-gnu/libc.so.6,
-        #     /lib/x86_64-linux-gnu/libpthread.so.0,
-        #     /lib/x86_64-linux-gnu/libm.so.6,
-        #     /lib/x86_64-linux-gnu/libdl.so.2,
-        #     /lib/x86_64-linux-gnu/librt.so.1
+        # Bind-mounts nvidia-smi plus every shared library it needs into
+        # any pod that requests a real Volcano vGPU slice, so it can
+        # actually run there. These exact paths are this project's own
+        # dcn-gpu-0 (Ubuntu 22.04, glibc), confirmed live end-to-end
+        # (2026-11-15): nvidia-smi runs and shows the real *sliced* view
+        # (e.g. 0MiB / 768MiB for a 12-unit request, never the physical
+        # card's 24576 MiB) -- see config/vmgpu/README.md. On a
+        # *different* host, re-run `which nvidia-smi && ldd
+        # "$(which nvidia-smi)"` there and use its real paths instead of
+        # assuming these; on a cluster with no reason to debug inside
+        # the sandbox, comment this back out (it's a no-op until a pod
+        # actually requests a vGPU slice, but there's no reason to carry
+        # it otherwise).
+        - name: VGPU_DEBUG_HOST_MOUNTS
+          value: >-
+            /usr/bin/nvidia-smi,
+            /lib64/ld-linux-x86-64.so.2,
+            /lib/x86_64-linux-gnu/libc.so.6,
+            /lib/x86_64-linux-gnu/libpthread.so.0,
+            /lib/x86_64-linux-gnu/libm.so.6,
+            /lib/x86_64-linux-gnu/libdl.so.2,
+            /lib/x86_64-linux-gnu/librt.so.1
         ports:
         - containerPort: 8443
         readinessProbe:

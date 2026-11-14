@@ -371,10 +371,26 @@ behind it is unit-tested (see `internal/substratebridge/kubectlate_test.go`).
       `VFIO_IOMMU_GROUPS`) — an operator sets it to `nvidia-smi`'s own
       path plus everything `ldd $(which nvidia-smi)` lists on their own
       node. See `config/webhook/podgate-webhook.yaml` for this project's
-      own real, confirmed list on `dcn-gpu-0`. Not yet verified that
-      `nvidia-smi` actually runs end-to-end once mounted in (the next
-      real-hardware step); the pod-annotation check above remains the
-      verification method that needs no in-container exec at all.
+      own real, confirmed list on `dcn-gpu-0`.
+    - **Verified end-to-end on real hardware (2026-11-15):** once the
+      three mounts above actually land in a *freshly created* worker pod
+      (the webhook only mutates pods at creation — redeploying it has no
+      effect on a pod that already exists; the 3 demo pods are
+      long-lived and reused across actor suspend/resume, confirmed by
+      their `AGE` never resetting across many cycles, so making this
+      take effect needed `kubectl delete pod -l
+      ate.dev/worker-pool=gnwes-counter-vgpu` to force the WorkerPool to
+      recreate them), `nvidia-smi` runs and shows the real *sliced*
+      view: `0MiB / 768MiB` — exactly the 12-unit (768 MiB) request,
+      never the physical card's 24576 MiB — on `00000000:D8:00.0`,
+      matching `GPU-ed7db115` from the `lspci` dump above. One more
+      directly-observed, not assumed, detail: the hijack library's own
+      startup banner reads `[HAMI-core Msg...]` — so the real
+      GPU-virtualization library here genuinely is HAMi-lineage code;
+      it's Volcano's own scheduler and device plugin that *orchestrate*
+      it, not generic upstream Project-HAMi's scheduler extension. Worth
+      being precise about rather than over- or under-crediting HAMi
+      after the 2026-11-15 correction above.
   **What IS now done (2026-11-13):** `ateworker-microvm` turned out to
   already exist and ship upstream in agent-substrate (Kata on
   cloud-hypervisor, confirmed via `pkg/sandboxclass.All()` and

@@ -638,10 +638,34 @@ done
 annotations named the exact same physical GPU UUID, the third named the
 node's other physical GPU — real concurrent multi-actor sharing of one
 physical TITAN RTX, not three separate devices and not actors taking
-turns. `kubectl exec ... nvidia-smi` inside a pod doesn't work —
-`ateworker-gvisor`'s image has no shell/coreutils at all to exec into —
-so the annotation check above is the verification method that doesn't
-need in-container exec.
+turns. This pattern held across a repeated 5-cycle benchmark
+(`scripts/bench-vgpu-concurrency.sh 5`, n=15 resume-to-Running samples):
+`GPU-80e6777e...` hosted exactly 2 actors and `GPU-ed7db115...` exactly 1,
+every single cycle, not a one-off — with time-to-Running
+min=1960ms, p50=3016ms, p95=5937ms, max=5937ms for 3 concurrent resumes.
+
+**`nvidia-smi` inside a pod — fixed, and verified end-to-end.**
+`kubectl exec ... nvidia-smi` fails because `ateworker-gvisor`'s image
+has no shell/coreutils to exec into at all, but GPU access itself
+already works (real device nodes, the driver's own libraries already
+bind-mounted in by the vgpu-device-plugin) — the only real gap was glibc
+and the `nvidia-smi` binary itself, since the image is a
+statically-linked Go binary with no userspace libraries of its own. Now
+fixed via `podgate-webhook`'s `VGPU_DEBUG_HOST_MOUNTS` (see
+`config/vmgpu/README.md`'s 2026-11-15 entry for the full root-cause and
+fix). **Important operational note, confirmed the hard way**: the
+webhook only mutates pods at *creation* — the 3 demo pods are long-lived
+and get reused across every actor suspend/resume (their `AGE` never
+resets), so redeploying the webhook with a new `VGPU_DEBUG_HOST_MOUNTS`
+has no effect until the pods themselves are recreated:
+```bash
+for i in 1 2 3; do kubectl-ate suspend actor gnwes-actor-vgpu-$i -a ate-demo-counter; done
+kubectl delete pod -n ate-demo-counter -l ate.dev/worker-pool=gnwes-counter-vgpu
+for i in 1 2 3; do kubectl-ate resume actor gnwes-actor-vgpu-$i -a ate-demo-counter; done
+```
+Once that's done, `nvidia-smi` shows the real *sliced* view —
+`0MiB / 768MiB`, exactly the 12-unit request, never the physical card's
+24576 MiB — confirming the limit is real, not just requested.
 
 ## Is this real, or simulated? Be precise about which parts
 
