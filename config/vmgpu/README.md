@@ -18,7 +18,14 @@ work completely differently, on purpose:
   same physical card, each one able to see and prove it only has its own
   small slice (`nvidia-smi` run *inside* one shows `0MiB / 768MiB`, not
   the full 24576 MiB). A job's slice is handed out once, when it starts
-  — there's no "moving" a slice later.
+  — there's no "moving" a slice later. **A slice does get handed to a
+  *different* job later, though** — confirmed live (2026-11-15): when a
+  job is paused (suspended), it gives up its spot entirely (`WORKER POD`
+  shows `<none>`), and that same spot — including its slice — was then
+  claimed by a genuinely new, just-created job, which got the exact same
+  slice size and the correct enforced limit. This is the same mechanism
+  already used for ordinary CPU/memory — nothing GPU-specific had to be
+  built for it.
 - **1 of them (`18:00.*`) is "exclusive."** It's handed entirely to one
   virtual machine at a time — no sharing, no slicing, the VM gets the
   real whole card with real hardware-level isolation, the same as if it
@@ -261,6 +268,38 @@ behind it is unit-tested (see `internal/substratebridge/kubectlate_test.go`).
     test guest has no NVIDIA driver installed, so `nvidia.ko` itself
     binding to the device specifically is still unconfirmed — a separate,
     narrower claim than kernel-level enumeration.)
+
+    **Checked 2026-11-15: this is fixable, and how, confirmed by reading
+    agent-substrate's own source — not yet built.** The fast, millisecond
+    hotplug binding this tier depends on only works if `nvidia.ko` is
+    already loaded in the guest kernel *before* the hot-attach happens
+    (an already-loaded driver binds to a newly-appearing matching PCI
+    device automatically and fast; installing a driver after the fact is
+    seconds-to-minutes, not milliseconds). That means a custom,
+    driver-included Kata guest kernel+rootfs, not a config change.
+    Confirmed directly from agent-substrate's own code
+    (`api/infra/k8s/ate/v1/sandboxconfig_types.go`,
+    `cmd/ate-setup/internal/steps/microvm.go`) that this is supported,
+    not blocked: `SandboxConfig` is a generic, data-driven CRD — each
+    version is just a named set of `{url, sha256}` asset pairs
+    (`kata-kernel`, `kata-image`, etc.) per architecture, with no
+    assumption baked in about where those files came from. `ate-setup`'s
+    own CLI only ever downloads the *stock* upstream Kata release and
+    checks pinned hashes against it — that's one convenience tool's own
+    rigidity, not a property of the CRD. A **second, independent**
+    `SandboxConfig` (e.g. `microvm-gpu-driver`) pointing at a custom
+    `vmlinux` (kernel built with `nvidia.ko` compiled in, matching this
+    host's exact `580.178.04` driver) and a custom `rootfs.img` (the
+    stock Kata image with the matching userspace driver bits added,
+    using Kata's own upstream `osbuilder`/`image-builder` tooling —
+    referenced directly in this repo's own extraction code's comments —
+    not a from-scratch image, so `kata-agent` stays intact) would work
+    with zero GNWES code changes: build the assets, upload them anywhere
+    the node's object-store plugin can reach, `kubectl apply` the new
+    `SandboxConfig`, and point
+    `gnwes-counter-exclusive-workerpool.yaml.tmpl`'s `configRef` at it.
+    This is real, scoped, buildable engineering work — just not yet
+    attempted in this project.
   - Detach found and fixed two real bugs in
     `VMGPUAttachmentReconciler.reconcileDetach`: Agent Substrate's actor
     `suspend` fully tears down the microVM's whole working directory (not
@@ -458,6 +497,22 @@ behind it is unit-tested (see `internal/substratebridge/kubectlate_test.go`).
       it, not generic upstream Project-HAMi's scheduler extension. Worth
       being precise about rather than over- or under-crediting HAMi
       after the 2026-11-15 correction above.
+    - **Cross-actor pod/slice reclaim, confirmed live (2026-11-15), not
+      just assumed from Substrate's own design docs:** suspended
+      `gnwes-actor-vgpu-1`, confirmed its `WORKER POD` dropped to
+      `<none>`, then created and resumed a brand-new
+      `gnwes-actor-vgpu-4` against the same pool — it landed on exactly
+      the pod actor-1 had just vacated
+      (`gnwes-counter-vgpu-...-g4vr4`), inherited the identical
+      `volcano.sh/vgpu-cores: 30` / `vgpu-memory: 12` slice, and
+      `nvidia-smi` confirmed the same correctly-enforced `0MiB / 768MiB`
+      limit on the same physical GPU. No GNWES code made this happen —
+      it's Agent Substrate's own `WorkerPool` pod-reuse mechanism, the
+      same one already proven for the Exclusive tier; the vGPU slice
+      rides along with it for free because the slice is a property of
+      the pod template, not of the actor. The round-trip back (suspend
+      actor-4, resume actor-1) cleanly restored the original pod
+      assignment, confirming this isn't one-directional either.
   **What IS now done (2026-11-13):** `ateworker-microvm` turned out to
   already exist and ship upstream in agent-substrate (Kata on
   cloud-hypervisor, confirmed via `pkg/sandboxclass.All()` and

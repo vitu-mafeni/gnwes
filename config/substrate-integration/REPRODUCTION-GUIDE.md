@@ -667,6 +667,21 @@ Once that's done, `nvidia-smi` shows the real *sliced* view —
 `0MiB / 768MiB`, exactly the 12-unit request, never the physical card's
 24576 MiB — confirming the limit is real, not just requested.
 
+**Cross-actor pod/slice reclaim — confirmed live (2026-11-15):**
+```bash
+kubectl-ate suspend actor gnwes-actor-vgpu-1 -a ate-demo-counter
+# expect: WORKER POD -> <none>
+kubectl-ate create actor gnwes-actor-vgpu-4 -a ate-demo-counter --template gnwes-counter-vgpu
+kubectl-ate resume actor gnwes-actor-vgpu-4 -a ate-demo-counter
+# expect: actor-4 lands on exactly the pod actor-1 just vacated, with the
+# same vgpu-cores/vgpu-memory slice -- confirm via nvidia-smi as above
+```
+A brand-new actor claimed the pod actor-1 had just freed, inherited the
+identical slice, and `nvidia-smi` confirmed the same correctly-enforced
+limit. This is Agent Substrate's own `WorkerPool` pod-reuse mechanism —
+no GNWES code makes this happen, the vGPU slice just rides along with
+it because it's a property of the pod template, not of the actor.
+
 ## Is this real, or simulated? Be precise about which parts
 
 **Updated 2026-11-13: the GPUWorkerPool/GPULease mock pool described in the
