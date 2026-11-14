@@ -319,41 +319,58 @@ shell-script stand-in — the thing that would actually ship.
 
 ## Phase 3 — the GPU lands in the agent's own sandbox (real WorkerPool integration)
 
-This is the actual end state: a Substrate `WorkerPool` running the
-**microVM** worker type (`ateworker-microvm`, Kata on Cloud Hypervisor,
-confirmed from Substrate's own source in `research/live-attach-poc/README.md`)
-instead of gVisor, so the api-socket `VMGPUAttachment` targets is the
-*agent's own* sandbox, not a side VM.
+**Done, confirmed on real hardware (2026-11-13/14) — this section originally
+described Phase 3 as future work requiring a separate Kata Containers
+install. That assumption was wrong, corrected below once the real
+mechanism was understood by actually running it.**
 
-1. Install Kata Containers on `dcn-gpu-0`, configured to use `cloud-hypervisor`
-   as its VMM (Kata supports multiple VMM backends; this needs Kata's own
-   `configuration-clh.toml` selected, not the QEMU default).
-2. Confirm Kata can boot a plain microVM sandbox on this node before
-   touching Substrate at all (`kata-runtime`/`ctr` or a minimal
-   containerd+Kata smoke test) — isolate Kata/CH problems from GNWES/Substrate
-   problems.
-3. Create a Substrate `ActorTemplate`/`WorkerPool` pair with
-   `sandboxClass: <whatever Substrate's microVM class is named>` instead of
-   `gvisor-default` (check `config/substrate-integration`'s upstream clone
-   for the exact value — not yet confirmed in this repo).
-4. Once a worker pod is `Running`, find its *real* Kata-assigned api-socket
-   (`/run/vc/vm/<id>/clh-api.sock` per Substrate's own `internal/ch`
-   package) — this path is per-worker, dynamic, and not something this repo
-   currently discovers automatically.
-5. **Needed, not-yet-built enhancement**: either create one
-   `VMGPUAttachment` per worker pod with its discovered socket path
-   (workable, matches WorkerPool's per-worker pattern, but needs something
-   to create/delete these objects as workers come and go — not built), or
-   extend `cmd/substrate-gpu-bridge` to resolve a worker's socket path
-   itself from the actor's `WorkerAssignment` rather than a static
-   `-attachment-name` flag.
-6. Repeat the resume/suspend test; this time confirm the GPU appears inside
-   the actor's own running sandbox (e.g. via `kubectl-ate` exec into it),
-   not a separate VM.
+A Substrate `WorkerPool` with `sandboxClasses: [microvm]` runs the
+**microVM** worker type, `ateworker-microvm` (Kata on Cloud Hypervisor,
+confirmed from Substrate's own source). The api-socket `VMGPUAttachment`
+targets is the *agent's own* sandbox, not a side VM — exactly the real end
+state this phase set out to reach.
 
-This phase is real additional engineering, not a rerun of what exists —
-call it out plainly if pursued, same as the rest of this project's
-documentation standard.
+What actually made this work, corrected against the plan above:
+
+- **No separate Kata Containers install needed on `dcn-gpu-0` at all.**
+  `ateworker-microvm` runs as a perfectly ordinary container under CRI-O's
+  own plain default runtime (confirmed: no pod on this cluster sets
+  `runtimeClassName`, so CRI-O's resolved `default_runtime` — `runc` on
+  this cluster — applies; see `config/substrate-integration/
+  REPRODUCTION-GUIDE.md`). It is not itself run under a Kata-shimmed CRI-O
+  runtime handler; it manages its own nested cloud-hypervisor VM directly
+  via `/dev/kvm` from inside that ordinary container. Step 1 and step 2's
+  Kata/CH smoke test above were never actually necessary.
+- **The real api-socket path is `/run/vc/vm/<actor-uid>/clh-api-restore.sock`,
+  not `clh-api.sock`.** Every `kubectl-ate resume`, including an actor's
+  very first one, goes through Substrate's restore-from-checkpoint path,
+  which launches cloud-hypervisor with this name permanently — confirmed
+  the hard way (2026-11-13), see `internal/substratebridge/bridge.go`'s
+  `clhAPISocketName` doc comment.
+- **Per-worker `VMGPUAttachment` creation is built, not a needed
+  enhancement.** `GPUWorkerPoolReconciler.reconcileExclusive`
+  (`internal/controller/gpuworkerpool_controller.go`) creates one
+  `VMGPUAttachment` per real Exclusive-tier worker pod automatically as
+  pods come and go.
+- **`cmd/substrate-gpu-bridge` resolving the socket path itself is built**
+  (the second option this section originally listed as unbuilt): it
+  resolves whichever actor is *currently* assigned to its worker pod
+  (`internal/substratebridge`) and writes `apiSocket`/`desiredState`
+  together from that actor's real UID, rather than watching one fixed
+  actor name.
+- **Confirming the GPU inside the guest doesn't need `kubectl-ate exec`**
+  (which doesn't exist — `kubectl-ate --help` lists no `exec` subcommand,
+  and the worker container itself has no shell to exec into). The real
+  confirmation is the guest's own cloud-hypervisor **console log**
+  (`/var/lib/gnwes/vcvm/<vcVMID>/<actorUID>/console.log` on the node): it
+  shows the guest kernel live-enumerating the device
+  (`pci 0000:00:08.0: [10de:1e02] ...`) and a `kata-agent` uevent
+  (`action: "add"`), timestamped to the millisecond against the
+  attachment's own `lastTransitionAt`.
+
+See `config/substrate-integration/REPRODUCTION-GUIDE.md` and
+`config/vmgpu/README.md` for the full real-hardware run this phase
+produced, including the real bugs found and fixed along the way.
 
 ## Testing with a Jupyter notebook
 
