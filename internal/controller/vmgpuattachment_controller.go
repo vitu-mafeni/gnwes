@@ -184,7 +184,17 @@ func (r *VMGPUAttachmentReconciler) reconcileAttach(ctx context.Context, att *gn
 }
 
 func (r *VMGPUAttachmentReconciler) reconcileDetach(ctx context.Context, att *gnwesv1alpha1.VMGPUAttachment, poolKey, attachKey string, ch CHDevicePlugger) (ctrl.Result, error) {
-	if att.Status.Phase != gnwesv1alpha1.VMGPUPhaseAttached {
+	// Keyed on DeviceID, not Phase: Phase can be Failed while a device is
+	// still genuinely held (a previous detach attempt's vm.remove-device
+	// call failed for a real reason, see vmGone below) -- DeviceID is the
+	// actual source of truth for "is a device currently recorded as held by
+	// this attachment." Confirmed live (2026-11-14): checking Phase !=
+	// Attached here meant an attachment already sitting in Phase=Failed
+	// from an earlier failed detach attempt short-circuited straight to
+	// "nothing to do" on every subsequent reconcile, forever, without ever
+	// retrying RemoveDevice or reaching vmGone's recovery path below --
+	// stuck permanently, even after the fix that added vmGone itself.
+	if att.Status.DeviceID == "" {
 		// Nothing attached (fresh object, or already detached): just record
 		// the desired state as observed.
 		if att.Status.Phase == "" {

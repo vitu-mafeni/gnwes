@@ -389,6 +389,86 @@ func TestVMGPUAttachment_RemoveDeviceFailureStaysFailedWhenSocketStillExists(t *
 	}
 }
 
+// TestVMGPUAttachment_RetriesDetachForAnAttachmentAlreadyStuckInFailed covers
+// the other half of the same real bug found live (2026-11-14): an
+// attachment that had already settled into Phase=Failed from an earlier
+// failed detach attempt (DeviceID still recorded, matching what the
+// success path leaves behind) was never retried again on any LATER
+// reconcile, because the old guard checked Phase != Attached -- which is
+// true for Failed too -- and short-circuited straight to "nothing to do"
+// every single time, forever, never even reaching vmGone's recovery path.
+// Confirmed against a real cluster: restarting cmd/manager (which
+// re-triggers an initial reconcile of every existing object) did NOT
+// unstick a VFIOGPUPool's availableDevices count stuck at 0 for exactly
+// this reason.
+func TestVMGPUAttachment_RetriesDetachForAnAttachmentAlreadyStuckInFailed(t *testing.T) {
+	att, mgr, pool := newVMGPUTestObjects(t)
+	socketPath := filepath.Join(t.TempDir(), "clh-api.sock")
+	if err := os.WriteFile(socketPath, nil, 0o600); err != nil {
+		t.Fatalf("creating fake socket file: %v", err)
+	}
+	att.Spec.APISocket = socketPath
+	fc := newFakeClient(t, att)
+	ch := newFakeCH()
+	r := &VMGPUAttachmentReconciler{Client: fc, VFIOManager: mgr, NewCHClient: func(string) CHDevicePlugger { return ch }}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "att-a", Namespace: "ns1"}}
+
+	// Get to Attached, then fail a detach for a real reason (socket still
+	// exists) so the object settles into Phase=Failed with DeviceID intact.
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile 1 (attach): %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile 2 (attach): %v", err)
+	}
+	ch.mu.Lock()
+	ch.removeErr = fmt.Errorf("simulated vm.remove-device failure")
+	ch.mu.Unlock()
+	var got gnwesv1alpha1.VMGPUAttachment
+	if err := fc.Get(context.Background(), req.NamespacedName, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got.Spec.DesiredState = gnwesv1alpha1.VMGPUDesiredDetached
+	if err := fc.Update(context.Background(), &got); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile (detach attempt 1, fails for real): %v", err)
+	}
+	if err := fc.Get(context.Background(), req.NamespacedName, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.Phase != gnwesv1alpha1.VMGPUPhaseFailed || got.Status.DeviceID == "" {
+		t.Fatalf("setup: Phase=%q DeviceID=%q, want Failed with DeviceID still set", got.Status.Phase, got.Status.DeviceID)
+	}
+
+	// Now the VM goes away entirely (its whole directory, socket included)
+	// -- simulating Substrate's suspend tearing it down -- and a LATER
+	// reconcile (e.g. a fresh cmd/manager process's initial sync) must
+	// still notice and recover, not treat the stuck Failed phase as final.
+	if err := os.Remove(socketPath); err != nil {
+		t.Fatalf("removing socket file: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile (detach attempt 2, VM now gone): %v", err)
+	}
+
+	if err := fc.Get(context.Background(), req.NamespacedName, &got); err != nil {
+		t.Fatalf("Get after recovery: %v", err)
+	}
+	if got.Status.Phase != gnwesv1alpha1.VMGPUPhaseDetached {
+		t.Fatalf("Phase = %q, want Detached -- a later reconcile must retry and recover a Failed attachment, not leave it stuck forever (message: %s)", got.Status.Phase, got.Status.Message)
+	}
+	if got.Status.DeviceID != "" {
+		t.Fatalf("DeviceID = %q, want empty after recovery", got.Status.DeviceID)
+	}
+
+	d, ok := pool.Get("gpu-0")
+	if !ok || d.State != vfiopool.DeviceAvailable {
+		t.Fatalf("device after recovering a stuck Failed attachment = %+v (ok=%v), want Available (released back)", d, ok)
+	}
+}
+
 func TestVMGPUAttachment_DeleteWhileAttachedDetachesAndReleases(t *testing.T) {
 	att, mgr, pool := newVMGPUTestObjects(t)
 	fc := newFakeClient(t, att)
