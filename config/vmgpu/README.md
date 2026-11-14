@@ -45,6 +45,20 @@ work completely differently, on purpose:
   driver stays the same (`vfio-pci`) before and after a VM lets go of
   it; only `kubectl get vmgpuattachment` and `kubectl get vfiogpupool`
   can tell you whether it's currently in use.
+- **GNWES did not invent the Shared tier's slicing — be precise about
+  that.** Volcano's scheduler and its own `volcano-vgpu-device-plugin`
+  (HAMi-lineage code) already do the real slicing and enforcement on
+  this cluster, with or without GNWES. What GNWES actually adds: Agent
+  Substrate's `WorkerPool` API has no field at all for requesting a
+  vGPU slice (no way to set the scheduler name, the runtime class, the
+  three resource keys, or the env vars the hijack library needs to not
+  break the driver mount) — `podgate-webhook`'s `volcanoVGPUPatches`
+  turns two simple pod labels into that whole correct request, Agent
+  Substrate's own actor-reuse-one-pod lifecycle stays correctly tracked
+  against it, and an operator picks this tier with the same one field
+  (`GPUWorkerPoolSpec.Backend`) used for the completely unrelated
+  Exclusive/VFIO mechanism. That's integration onto an existing
+  capability, not a new slicing mechanism.
 - **Is this reproducible?** The code for both mechanisms, the real bug
   fixes found along the way, and the exact commands to repeat every
   test are all committed to this repo (see `REPRODUCTION-GUIDE.md`) —
