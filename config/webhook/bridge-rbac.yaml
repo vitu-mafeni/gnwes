@@ -1,0 +1,93 @@
+# RBAC for the cmd/substrate-gpu-bridge sidecar podgate-webhook injects into
+# every Backend=Exclusive worker pod. The sidecar runs as whatever
+# ServiceAccount the worker pod itself uses (set via
+# WorkerPoolPodTemplate.serviceAccountName in the Exclusive-tier WorkerPool
+# manifest) -- it needs get+patch on VMGPUAttachment in that same namespace.
+#
+# It also shells out to kubectl-ate to resolve the actor assigned to this
+# worker pod, and kubectl-ate -- with no --endpoint given -- auto-port-
+# forwards to the ate-api-server: it does `get svc api -n ate-system`, lists
+# pods matching that Service's selector in ate-system, then opens a
+# pods/portforward subresource connection to one of them (see
+# agent-substrate's internal/portforward/portforward.go). Confirmed missing
+# the hard way (2026-11-13): without this second Role/RoleBinding pair, the
+# bridge's kubectl-ate calls fail with "services \"api\" is forbidden ...
+# in the namespace \"ate-system\"" forever, even though the VMGPUAttachment
+# RBAC above is already correct.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gnwes-substrate-gpu-bridge
+  namespace: ate-demo-counter
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gnwes-substrate-gpu-bridge
+  namespace: ate-demo-counter
+rules:
+- apiGroups: ["gnwes.io"]
+  resources: ["vmgpuattachments"]
+  verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gnwes-substrate-gpu-bridge
+  namespace: ate-demo-counter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gnwes-substrate-gpu-bridge
+subjects:
+- kind: ServiceAccount
+  name: gnwes-substrate-gpu-bridge
+  namespace: ate-demo-counter
+---
+# Separate Role/RoleBinding because this grants access in ate-system, a
+# different namespace than the ServiceAccount (ate-demo-counter) lives in --
+# a single namespaced Role can't span both.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gnwes-substrate-gpu-bridge-ate-api-portforward
+  namespace: ate-system
+rules:
+- apiGroups: [""]
+  resources: ["services"]
+  resourceNames: ["api"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["list"]
+# With no --token-file, kubectl-ate authenticates to ate-api-server by
+# minting itself a token for the shared "ate-client" ServiceAccount via
+# TokenRequest (see agent-substrate's internal/ateclient/builder.go,
+# bearerTokenDialOption) -- confirmed missing the hard way (2026-11-13):
+# "cannot create resource \"serviceaccounts/token\"".
+- apiGroups: [""]
+  resources: ["serviceaccounts/token"]
+  resourceNames: ["ate-client"]
+  verbs: ["create"]
+# NewSPDYOverWebsocketDialer upgrades the connection with a GET (not the
+# POST that plain SPDY/exec port-forwarding uses), which RBAC maps to the
+# "get" verb -- "create" alone isn't enough. Confirmed missing the hard
+# way (2026-11-13): "cannot get resource \"pods/portforward\"" even with
+# "create" already granted.
+- apiGroups: [""]
+  resources: ["pods/portforward"]
+  verbs: ["get", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gnwes-substrate-gpu-bridge-ate-api-portforward
+  namespace: ate-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gnwes-substrate-gpu-bridge-ate-api-portforward
+subjects:
+- kind: ServiceAccount
+  name: gnwes-substrate-gpu-bridge
+  namespace: ate-demo-counter

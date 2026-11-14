@@ -1,0 +1,98 @@
+# One-off Job working around ate-setup's hardcoded kind-only upload path
+# (cmd/ate-setup/internal/steps/microvm.go's stageMicroVMAssetsToRustfs runs
+# `docker run --network container:<k8s-node-name>`, which only works on real
+# kind clusters where the node name IS a docker container name -- on a real
+# cluster there is no such container, so it fails with "No such container").
+#
+# rustfs's NetworkPolicy (manifests/ate-install/kind/rustfs.yaml) admits
+# ingress only from pods labeled app=ate-api-server, app=atelet, or the
+# rustfs-bucket-init Job -- not "whichever node", despite the Go code's
+# comment. This Job satisfies that by labeling its pod app=atelet and
+# running the identical aws-cli upload from inside the cluster, reading the
+# already-downloaded asset files directly off server1's disk via hostPath.
+#
+# Confirmed content hashes (2026-11-12, sha256sum on server1):
+#   cloud-hypervisor -> 448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc
+#   virtiofsd        -> 15b2e72a78cc08a9bd8a6943e89fb69c88cb3cbeb63069efceade835342ac7d4
+#   vmlinux          -> f87d8359035cb7557b16a319e6431ea09b183e62268aef436bf8dc6530d786b6
+#   rootfs.img       -> 6770db2cca5710593f27c9ac5e1d9d7aab836422695a5e5c4807496a92a0f24d
+#
+# After this Job completes, ate-setup's own retry will find these objects
+# already in rustfs (its `s3 ls` existence check) and skip re-uploading them,
+# so no agent-substrate source changes are needed.
+#
+# This Job alone does NOT create the microvm SandboxConfig object itself --
+# that's a separate apply, normally also done by `ate-setup`'s microvm step.
+# If you ran this Job standalone (as this repo's REPRODUCTION-GUIDE.md Phase 4
+# does, without re-running ate-setup), apply it directly:
+#   sed -e 's/\${BUCKET_SCHEME}/s3/g' -e 's/\${ASSET_BUCKET_NAME}/ate-snapshots/g' \
+#     <agent-substrate checkout>/manifests/ate-install/sandboxconfig-microvm.yaml.tmpl \
+#     | kubectl apply -f -
+# Confirmed missing (2026-11-13) on this exact cluster even though the assets
+# were already staged -- `kubectl get workerpool` showed RESOLVED=False,
+# `kubectl get sandboxconfig -A` showed only `gvisor-default`, until this was
+# applied.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: microvm-assets-upload
+  namespace: ate-system
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: atelet
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/hostname: server1
+      containers:
+      - name: upload
+        image: amazon/aws-cli:2.38.5@sha256:c8156a0e74e13929a42d7e60f0d4e14e7d28d980cd21822505d4bff80e5460c1
+        env:
+        - name: AWS_ACCESS_KEY_ID
+          value: rustfsadmin
+        - name: AWS_SECRET_ACCESS_KEY
+          value: rustfsadmin
+        - name: AWS_REGION
+          value: us-east-1
+        - name: AWS_ENDPOINT_URL
+          value: http://rustfs.ate-system.svc:9000
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -e
+          # An earlier run (2026-11-12) hit "throttling" caused by rustfs-data's
+          # PVC being 95% full -- fixed then by expanding the PVC to 40Gi.
+          # Re-run on 2026-11-13 against that same (now mostly empty, 2% used)
+          # PVC and hit throttling again on rootfs.img specifically (the one
+          # 268MB file, the other three are 3-40MB and uploaded fine both
+          # times) -- so disk space was never the only cause. The real one,
+          # confirmed this time: aws-cli v2's default CRT-based S3 transfer
+          # client cancels a multipart upload under a minimum-throughput
+          # heuristic tuned for real AWS network conditions ("AWS_ERROR_HTTP_
+          # CHANNEL_THROUGHPUT_FAILURE"), which this self-hosted rustfs
+          # backend doesn't reliably meet. Forcing the classic (non-CRT)
+          # transfer client, smaller multipart chunks, and more SDK-level
+          # retries fixed it -- slow (observed ~4-7 MiB/s) but reliable.
+          aws configure set s3.preferred_transfer_client classic
+          aws configure set s3.max_concurrent_requests 1
+          aws configure set s3.multipart_chunksize 16MB
+          aws configure set max_attempts 10
+          aws configure set retry_mode standard
+          aws s3 cp /assets/cloud-hypervisor s3://ate-snapshots/microvm-assets/amd64/448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc
+          aws s3 cp /assets/virtiofsd s3://ate-snapshots/microvm-assets/amd64/15b2e72a78cc08a9bd8a6943e89fb69c88cb3cbeb63069efceade835342ac7d4
+          aws s3 cp /assets/vmlinux s3://ate-snapshots/microvm-assets/amd64/f87d8359035cb7557b16a319e6431ea09b183e62268aef436bf8dc6530d786b6
+          aws s3 cp /assets/rootfs.img s3://ate-snapshots/microvm-assets/amd64/6770db2cca5710593f27c9ac5e1d9d7aab836422695a5e5c4807496a92a0f24d
+          echo "upload complete"
+        volumeMounts:
+        - name: assets
+          mountPath: /assets
+          readOnly: true
+      volumes:
+      - name: assets
+        hostPath:
+          path: /home/ubuntu/projects/substrate/bin/microvm-assets/amd64
+          type: Directory

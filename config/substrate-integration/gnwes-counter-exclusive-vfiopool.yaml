@@ -1,0 +1,24 @@
+# A real node's VFIO-bound GPU inventory for the Exclusive-tier demo (see
+# gnwes-counter-exclusive-pool.yaml). Same CRD/shape as
+# config/vmgpu/vfiogpupool-sample.yaml, just in ate-demo-counter's namespace
+# so GPUWorkerPoolReconciler's reconcileExclusive (which looks the
+# VFIOGPUPool up in the GPUWorkerPool's own namespace) can find it.
+#
+# nodeName and the devices list are placeholders -- fill in with this
+# cluster's real values before applying:
+#   lspci -Dnn | grep -i nvidia   # PCI addresses
+#   /sys/bus/pci/devices/<address>/   # each device's pciPath
+# This device must actually be VFIO-bound (vfio-pci driver), not in use by
+# nvidia/nouveau, and NOT the same physical GPU gnwes-counter-pool.yaml's
+# Shared-tier nvidia.com/gpu device plugin is already advertising -- the two
+# tiers draw from disjoint device pools on purpose; see REPRODUCTION-GUIDE.md.
+apiVersion: gnwes.io/v1alpha1
+kind: VFIOGPUPool
+metadata:
+  name: gnwes-counter-exclusive-gpus
+  namespace: ate-demo-counter
+spec:
+  nodeName: CHANGE-ME-node-name
+  devices:
+  - id: gpu-exclusive-0
+    pciPath: /sys/bus/pci/devices/CHANGE-ME-0000:00:00.0/

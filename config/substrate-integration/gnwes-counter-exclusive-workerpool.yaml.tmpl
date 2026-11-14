@@ -1,0 +1,72 @@
+# A real Agent Substrate WorkerPool (apiVersion ate.dev/v1), the Exclusive
+# (VFIO hot-attach) counterpart to gnwes-counter-workerpool.yaml.tmpl's
+# Backend=Shared pool. Same counter actor app, different sandbox class and
+# GPU mechanism -- see gnwes-counter-exclusive-pool.yaml and
+# REPRODUCTION-GUIDE.md's "Is this real, or simulated?" table.
+#
+# sandboxClasses: [microvm] selects agent-substrate's own
+# cmd/ateworker-microvm (Kata on cloud-hypervisor) instead of
+# cmd/ateworker-gvisor -- a real, already-shipped worker binary (confirmed
+# via pkg/sandboxclass.All() and docs/reference/sandbox-classes.md in the
+# real agent-substrate/substrate repo), not something GNWES builds. It needs
+# this node's kernel/rootfs/cloud-hypervisor/virtiofsd assets already staged
+# in rustfs -- see microvm-assets-upload-job.yaml, already run once against
+# this cluster's ate-system (2026-11-12).
+#
+# ate.dev/kvm is atelet's own device-plugin-advertised extended resource,
+# gating this pod onto a KVM-capable node only (confirmed in
+# agent-substrate's workerpool_apply.go's maybeApplyMicroVMPodShape) -- not
+# something GNWES invented or needs to request a device plugin for itself.
+#
+# spec.template.labels carries three things podgate-webhook (../webhook/
+# podgate-webhook.yaml) reads to decide what to inject into this pool's
+# pods, since WorkerPoolPodTemplate has no scheduling-gate, sidecar, or
+# volume field of its own:
+#   gnwes.io/gpu-pool:     gnwes-counter-exclusive-pool  (which GPUWorkerPool
+#                          gates/attaches against)
+#   gnwes.io/gpu-backend:  Exclusive                     (inject the
+#                          substrate-gpu-bridge sidecar + shared
+#                          /run/vc/vm volume, not just the gate)
+#   gnwes.io/atespace:     ate-demo-counter               (passed to the
+#                          injected sidecar's -atespace flag)
+#
+# serviceAccountName must be the identity config/webhook/bridge-rbac.yaml
+# grants get+patch on vmgpuattachments to -- the injected bridge sidecar has
+# no other way to read/write its own pod's VMGPUAttachment.
+#
+# workerImage uses a ko:// reference exactly like upstream's own templates;
+# resolve it the same way demos/counter does before applying -- do not
+# hardcode a resolved sha256 digest here.
+apiVersion: ate.dev/v1
+kind: WorkerPool
+metadata:
+  name: gnwes-counter-exclusive
+  namespace: ate-demo-counter
+  labels:
+    workload: gnwes-counter-exclusive
+spec:
+  replicas: 1
+  workerImage: ko://go.ate.dev/substrate/cmd/ateworker-microvm
+  sandboxClasses:
+  - name: microvm
+  template:
+    labels:
+      gnwes.io/gpu-pool: gnwes-counter-exclusive-pool
+      gnwes.io/gpu-backend: Exclusive
+      gnwes.io/atespace: ate-demo-counter
+    # Pinned to this cluster's one GPU-VFIO-bound node: ate.dev/kvm alone
+    # isn't enough if more than one node advertises it (e.g. a control-plane
+    # node that also happens to have /dev/kvm) -- the real GPU this pool's
+    # VFIOGPUPool references is physically on dcn-gpu-0's PCI bus, so this
+    # workload must land there specifically, not just "somewhere with KVM".
+    nodeSelector:
+      kubernetes.io/hostname: dcn-gpu-0
+    serviceAccountName: gnwes-substrate-gpu-bridge
+    resources:
+      limits:
+        cpu: "2"
+        memory: 2Gi
+        ate.dev/kvm: "1"
+      requests:
+        cpu: 500m
+        memory: 2Gi

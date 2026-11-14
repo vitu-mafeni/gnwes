@@ -1,0 +1,16 @@
+# GNWES's GPUWorkerPool CR for the Exclusive-tier (VFIO hot-attach) half of
+# the Substrate integration demo, alongside gnwes-counter-pool.yaml's
+# Backend=Shared pool. Must be created in ate-demo-counter (same namespace
+# gnwes-counter-exclusive-workerpool.yaml.tmpl's pods land in), because
+# PodGateReconciler looks up pools by "<pod namespace>/<gnwes.io/gpu-pool
+# value>", same as the Shared-tier pool.
+apiVersion: gnwes.io/v1alpha1
+kind: GPUWorkerPool
+metadata:
+  name: gnwes-counter-exclusive-pool
+  namespace: ate-demo-counter
+spec:
+  poolSize: 1
+  backend: Exclusive
+  gpuModel: A100-40GB
+  vfioPoolRef: gnwes-counter-exclusive-gpus
