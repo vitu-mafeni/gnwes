@@ -698,6 +698,17 @@ specific than "is this simulated":
     `*.conf` — a stray `.conf.bak` backup left in that directory gets
     loaded too and can silently override a later edit. Keep config
     backups outside `crio.conf.d/`.
+- **The full attach → detach → re-attach cycle, and the guest-kernel side
+  of the hot-attach, are now also confirmed (2026-11-14).** Two more real
+  bugs found and fixed in `VMGPUAttachmentReconciler.reconcileDetach`
+  (Substrate's actor `suspend` fully tears down the VM, so a device could
+  get stuck "held" in the pool forever; a `Phase: Failed` attachment was
+  never retried on later reconciles), plus two real operational
+  requirements for running `cmd/manager` on the GPU node (must run as
+  root; needs a `KUBECONFIG` with the cluster's *current* CA) and a CRI-O
+  `default_ulimits` fix for VFIO's memory-pinning requirement. Full detail,
+  including the guest console-log evidence of live kernel-level PCI
+  hotplug, is in `config/vmgpu/README.md` — not duplicated here.
 - **The actor→api-socket resolution is now confirmed against a real
   `kubectl-ate get actor` and a real cloud-hypervisor VM's actual
   `/run/vc/vm/<id>/clh-api-restore.sock`** (previously unit-tested only)

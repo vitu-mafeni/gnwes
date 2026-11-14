@@ -176,11 +176,68 @@ behind it is unit-tested (see `internal/substratebridge/kubectlate_test.go`).
   bug in `internal/chclient`'s `Iommu` field (string vs. the real
   cloud-hypervisor API's boolean) and a missing watch predicate on
   `VMGPUAttachmentReconciler` that both had to be fixed first to even see
-  this EPERM clearly. **Still not confirmed either way**: whether the
-  guest's NVIDIA driver actually re-probes the hot-added PCI device without
-  a reboot — this run confirmed the host-side attach (cloud-hypervisor's
-  API call and `guestBDF` assignment), not what the guest OS does with it
-  afterward. See `research/live-attach-poc/README.md`'s "Next steps".
+  this EPERM clearly.
+
+  **Updated 2026-11-14 — the full attach → detach → re-attach cycle is now
+  confirmed end-to-end, including the guest-kernel side:**
+  - ~~Still not confirmed either way: whether the guest's NVIDIA driver
+    actually re-probes the hot-added PCI device without a reboot~~ —
+    resolved. The actor's cloud-hypervisor **console log**
+    (`/var/lib/gnwes/vcvm/<vcVMID>/<actorUID>/console.log` on the node)
+    shows the guest kernel live-enumerating the device the moment it was
+    added: `pci 0000:00:08.0: [10de:1e02] type 00 class 0x030000 PCIe
+    Legacy Endpoint`, full BAR assignment, and a `kata-agent` uevent
+    (`action: "add"`) timestamped to the millisecond against the
+    attachment's own `lastTransitionAt`. This confirms real, live
+    kernel-level PCI hotplug enumeration — the prerequisite any driver
+    binds to — not just cloud-hypervisor's own API call succeeding. (This
+    test guest has no NVIDIA driver installed, so `nvidia.ko` itself
+    binding to the device specifically is still unconfirmed — a separate,
+    narrower claim than kernel-level enumeration.)
+  - Detach found and fixed two real bugs in
+    `VMGPUAttachmentReconciler.reconcileDetach`: Agent Substrate's actor
+    `suspend` fully tears down the microVM's whole working directory (not
+    just pauses it), so a live `vm.remove-device` call can never succeed
+    once that happens, and the device was staying stuck "held" in the pool
+    forever as a result (`VFIOGPUPool.status.availableDevices` stuck at
+    `0`) — see `vmGone`'s doc comment in
+    `internal/controller/vmgpuattachment_controller.go`. A second, related
+    bug meant an attachment already sitting in `Phase: Failed` from an
+    earlier failed detach attempt was *never retried on any later
+    reconcile* (the guard checked `Phase != Attached`, true for `Failed`
+    too) — fixed by keying the guard on `DeviceID` instead, the real source
+    of truth for "is a device currently held."
+  - **`nvidia-smi` on the host will *never* show this GPU, by design, and
+    that's not related to attach/detach state at all** — it's permanently
+    excluded from `nvidia.ko` via the initramfs hook (see
+    `TESTING-WITH-REAL-AGENTS.md`'s step 4), handed to `vfio-pci`
+    unconditionally at boot. The correct way to confirm a device is really
+    "back" after detach: `kubectl get vfiogpupool -o yaml`'s
+    `status.availableDevices`, and `readlink -f
+    /sys/bus/pci/devices/<BDF>/driver` on the host staying `vfio-pci`.
+  - **Two real operational requirements for `cmd/manager` on the GPU node,
+    neither obvious, both now documented in `scripts/start-manager.sh`:**
+    it must run as **root** (`ateworker-microvm` creates each actor's VM
+    directory `root:root`, mode `0700` — a non-root manager process gets a
+    distinct "permission denied" dialing the socket, not the `vmGone`
+    path's ENOENT), and its `KUBECONFIG` must point at a kubeconfig whose
+    CA matches the cluster's *current* CA (`sudo`'s `HOME` is `/root`, not
+    the invoking user's — it will NOT pick up `~ubuntu/.kube/config` on its
+    own, and a stale CA produces "x509: certificate signed by unknown
+    authority").
+  - **VFIO device passthrough needs a raised `memlock` ulimit** —
+    confirmed live via `vfio_pin_pages_remote: RLIMIT_MEMLOCK (8388608)
+    exceeded` in the host's `dmesg`: pinning a VM's entire guest memory for
+    DMA (required on `vm.restore`, i.e. every `kubectl-ate resume`) needs
+    far more than the Linux default 8 MiB. CRI-O applies ulimits at
+    container-create time, so an already-running worker pod needs
+    recreating to pick this up, same as the annotation fix.
+
+  All three CRI-O-side fixes above (`allowed_annotations`,
+  `allowed_devices`, `default_ulimits`) are one committed drop-in file,
+  not just prose: **`crio-vfio-devices.conf`** in this directory. Install
+  it at `/etc/crio/crio.conf.d/99999-vfio-annotations.conf` on each
+  Exclusive-tier GPU node and `sudo systemctl restart crio`.
   **What IS now done (2026-11-13):** `ateworker-microvm` turned out to
   already exist and ship upstream in agent-substrate (Kata on
   cloud-hypervisor, confirmed via `pkg/sandboxclass.All()` and
