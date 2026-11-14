@@ -98,7 +98,7 @@ func (d *fakeDriver) SetSpec(_ context.Context, s gnwesv1alpha1.VMGPUDesiredStat
 }
 
 func TestReconcileOnce_AppliesChangeWhenStatesDiffer(t *testing.T) {
-	fetcher := &fakeFetcher{state: "ACTOR_STATE_RUNNING"}
+	fetcher := &fakeFetcher{state: "ACTOR_STATE_RUNNING", uid: "actor-uid-1", apiSocket: "/var/lib/gnwes/vcvm/worker-1/actor-uid-1/clh-api.sock"}
 	driver := &fakeDriver{current: gnwesv1alpha1.VMGPUDesiredDetached}
 
 	changed, transition, err := ReconcileOnce(context.Background(), fetcher, driver)
@@ -120,8 +120,9 @@ func TestReconcileOnce_AppliesChangeWhenStatesDiffer(t *testing.T) {
 }
 
 func TestReconcileOnce_NoOpWhenAlreadyCorrect(t *testing.T) {
-	fetcher := &fakeFetcher{state: "ACTOR_STATE_RUNNING"}
-	driver := &fakeDriver{current: gnwesv1alpha1.VMGPUDesiredAttached}
+	sock := "/var/lib/gnwes/vcvm/worker-1/actor-uid-1/clh-api.sock"
+	fetcher := &fakeFetcher{state: "ACTOR_STATE_RUNNING", uid: "actor-uid-1", apiSocket: sock}
+	driver := &fakeDriver{current: gnwesv1alpha1.VMGPUDesiredAttached, currentSock: sock}
 
 	changed, _, err := ReconcileOnce(context.Background(), fetcher, driver)
 	if err != nil {
@@ -165,6 +166,31 @@ func TestReconcileOnce_AppliesAPISocketFromFetcher(t *testing.T) {
 	}
 	if driver.currentSock != want {
 		t.Errorf("driver.currentSock = %q, want %q", driver.currentSock, want)
+	}
+}
+
+// TestReconcileOnce_StaysDetachedWhenRunningButSocketUnknown guards
+// against regressing into the 2026-11-15 "dial unix: missing address"
+// bug: an actor reporting RUNNING before the bridge has learned its real
+// api-socket (a real window right after a fresh, non-restore VM boot --
+// HostAPISocketPath legitimately returns "" then) must not make
+// ReconcileOnce write Attached with an empty socket.
+func TestReconcileOnce_StaysDetachedWhenRunningButSocketUnknown(t *testing.T) {
+	fetcher := &fakeFetcher{state: "ACTOR_STATE_RUNNING", uid: "actor-uid-1", apiSocket: ""}
+	driver := &fakeDriver{current: gnwesv1alpha1.VMGPUDesiredDetached, currentSock: ""}
+
+	changed, transition, err := ReconcileOnce(context.Background(), fetcher, driver)
+	if err != nil {
+		t.Fatalf("ReconcileOnce: %v", err)
+	}
+	if changed {
+		t.Fatalf("expected changed=false (already Detached with no socket to attach), got transition=%+v", transition)
+	}
+	if transition.DesiredState != gnwesv1alpha1.VMGPUDesiredDetached {
+		t.Errorf("transition.DesiredState = %q, want Detached", transition.DesiredState)
+	}
+	if driver.current != gnwesv1alpha1.VMGPUDesiredDetached {
+		t.Errorf("driver.current = %q, want unchanged Detached", driver.current)
 	}
 }
 
@@ -242,7 +268,7 @@ func TestHostAPISocketPath_PrefersWhicheverSocketActuallyExists(t *testing.T) {
 }
 
 func TestReconcileOnce_SetErrorPropagates(t *testing.T) {
-	fetcher := &fakeFetcher{state: "ACTOR_STATE_RUNNING"}
+	fetcher := &fakeFetcher{state: "ACTOR_STATE_RUNNING", uid: "actor-uid-1", apiSocket: "/var/lib/gnwes/vcvm/worker-1/actor-uid-1/clh-api.sock"}
 	driver := &fakeDriver{current: gnwesv1alpha1.VMGPUDesiredDetached, setErr: fmt.Errorf("conflict")}
 
 	_, _, err := ReconcileOnce(context.Background(), fetcher, driver)
@@ -282,7 +308,7 @@ func TestRun_TracksActorTransitionsOverMultiplePolls(t *testing.T) {
 	// Give Run its immediate first tick, then flip the actor to RUNNING and
 	// let the next poll pick it up.
 	time.Sleep(15 * time.Millisecond)
-	fetcher.setState("ACTOR_STATE_RUNNING")
+	fetcher.setObservation("ACTOR_STATE_RUNNING", "actor-uid-1", "/var/lib/gnwes/vcvm/worker-1/actor-uid-1/clh-api.sock")
 	time.Sleep(30 * time.Millisecond)
 	fetcher.setState("ACTOR_STATE_SUSPENDED")
 	time.Sleep(30 * time.Millisecond)

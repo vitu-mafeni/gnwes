@@ -211,6 +211,22 @@ func ReconcileOnce(ctx context.Context, fetcher ActorStateFetcher, driver Attach
 	if desiredSocket != "" {
 		nextSocket = desiredSocket
 	}
+
+	// An actor can report RUNNING before this bridge has learned the
+	// VM's real api-socket path -- confirmed live (2026-11-15): a
+	// freshly-created (non-restore) worker pod's VM can take a few
+	// seconds after resume before cloud-hypervisor creates either
+	// possible socket file at all (see HostAPISocketPath's own doc
+	// comment on why it can legitimately return ""). Attaching with
+	// apiSocket="" would write a spec cmd/manager can only fail to dial
+	// ("dial unix: missing address") -- stay Detached until a later
+	// poll tick finds the real socket, rather than flipping to Attached
+	// on actor state alone.
+	if desiredState == gnwesv1alpha1.VMGPUDesiredAttached && nextSocket == "" {
+		desiredState = gnwesv1alpha1.VMGPUDesiredDetached
+		t.DesiredState = desiredState
+	}
+
 	if currentState == desiredState && nextSocket == currentSocket {
 		return false, t, nil
 	}
