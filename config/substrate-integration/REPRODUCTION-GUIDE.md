@@ -504,6 +504,23 @@ change.** Hit a real case on this cluster where a plain `docker build`
 silently produced a stale image despite a genuinely different source binary
 — not yet root-caused, `--no-cache` reliably avoided it.
 
+**`docker push` reliably times out on this image's two largest layers,
+confirmed live (2026-11-13, again 2026-11-15) — a plain retry doesn't
+help, it fails the same way every time.** The actual working fix:
+```bash
+docker save -o /tmp/<image-name>.tar <registry>/substrate-gpu-bridge:<tag>
+skopeo copy docker-archive:/tmp/<image-name>.tar \
+  docker://<registry>/substrate-gpu-bridge:<tag> --dest-tls-verify=false
+```
+`skopeo copy docker-daemon:... docker://...` looks like it should work
+without the intermediate tarball, but doesn't on this cluster's skopeo
+build — it fails on an unrelated Docker API version mismatch in its own
+vendored client (`client version 1.22 is too old`), even with
+`DOCKER_API_VERSION` set. `docker save` to a tarball first and using
+skopeo's `docker-archive:` source instead sidesteps that entirely (no
+daemon API call at all) and reliably succeeds where both `docker push`
+and `docker-daemon:` fail.
+
 ### 4.3 — the WorkerPool/ActorTemplate pair
 
 Both `workerImage` (WorkerPool) and `containers[].image` (ActorTemplate)

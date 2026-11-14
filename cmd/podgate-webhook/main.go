@@ -131,12 +131,15 @@ func main() {
 	// An operator can override this (e.g. to IfNotPresent) when a registry
 	// is temporarily unreachable and the image has instead been loaded
 	// directly onto each node's container runtime -- confirmed needed the
-	// hard way (2026-11-13): Harbor intermittently timed out committing
-	// this image's two largest layers, well after upload, for reasons
-	// unrelated to this code (its own registry pod's logs showed the
-	// failing requests never even arriving) -- see
+	// hard way (2026-11-13, again 2026-11-15): Harbor intermittently times
+	// out committing this image's two largest layers specifically, every
+	// time, via a plain `docker push` -- see
 	// config/substrate-integration/REPRODUCTION-GUIDE.md's Phase 4 for the
-	// skopeo-to-containers-storage workaround this unblocks. Deliberately
+	// real, confirmed-working workaround (`docker save` to a tarball, then
+	// `skopeo copy docker-archive:...`, which sidesteps `docker push`'s own
+	// client entirely -- skopeo's `docker-daemon:` transport does NOT work
+	// as a shortcut here, it fails on an unrelated Docker API version
+	// mismatch in its own vendored client, confirmed live). Deliberately
 	// NOT the new permanent default: for this sidecar's own normal
 	// rebuild-push-redeploy workflow, IfNotPresent would make a node keep
 	// reusing a stale cached :latest image instead of re-pulling after a
