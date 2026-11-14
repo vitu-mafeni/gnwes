@@ -2,6 +2,12 @@
 # created in the same namespace the target WorkerPool's pods land in
 # (ate-demo-counter), because PodGateReconciler looks up pools by
 # "<pod namespace>/<gnwes.io/gpu-pool value>".
+#
+# Backend=Shared (the default): this is a real Kubernetes-scheduled GPU
+# resource, not a simulation — see REPRODUCTION-GUIDE.md's "Is this real or
+# simulated?" section. gpuResourceName/gpuResourceQuantity must match
+# whatever gnwes-counter-workerpool.yaml.tmpl's template.resources.limits
+# actually requests.
 apiVersion: gnwes.io/v1alpha1
 kind: GPUWorkerPool
 metadata:
@@ -9,6 +15,7 @@ metadata:
   namespace: ate-demo-counter
 spec:
   poolSize: 1
-  gpuModel: A100-mock-40GB
-  slotInitMillis: 4000
-  attachLatencyMillis: 150
+  backend: Shared
+  gpuModel: A100-40GB
+  gpuResourceName: nvidia.com/gpu
+  gpuResourceQuantity: "1"

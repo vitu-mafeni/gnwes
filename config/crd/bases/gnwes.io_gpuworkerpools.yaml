@@ -17,6 +17,9 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
+    - jsonPath: .spec.backend
+      name: Backend
+      type: string
     - jsonPath: .status.phase
       name: Phase
       type: string
@@ -33,9 +36,10 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          GPUWorkerPool is a warm pool of simulated GPU slots that GPULeases attach
-          to. It is the GNWES control-plane object representing "N GPUs kept warm
-          and ready" ahead of any actor needing one.
+          GPUWorkerPool is a pool of real GPU capacity that GPULeases draw from. It
+          is the GNWES control-plane object representing "N GPUs this many actors
+          can concurrently hold," backed by whichever real mechanism Spec.Backend
+          selects.
         properties:
           apiVersion:
             description: |-
@@ -56,37 +60,57 @@ spec:
             type: object
           spec:
             description: |-
-              GPUWorkerPoolSpec defines a pool of pre-warmed, simulated GPU slots that
-              GPULeases attach to and detach from in sub-second time. The pool itself is
-              slow to stand up (SlotInitMillis per slot) — that cost is paid once, ahead
-              of any agent needing a GPU, not on every agent's critical path.
+              GPUWorkerPoolSpec defines a pool of real GPU capacity that GPULeases draw
+              from. Which tier's real attachment mechanism is used is controlled by
+              Backend — see GPUBackend's doc comments for what each one actually does
+              and does not provide.
             properties:
-              attachLatencyMillis:
-                default: 150
-                description: |-
-                  AttachLatencyMillis simulates the CDI-injection attach cost paid when a
-                  GPULease binds an already-warm slot to a running actor pod. This models
-                  the fast path GNWES exists to deliver.
-                format: int32
-                type: integer
+              backend:
+                default: Shared
+                description: Backend selects the real attachment mechanism. Defaults
+                  to Shared.
+                enum:
+                - Shared
+                - Exclusive
+                type: string
               gpuModel:
                 description: |-
-                  GPUModel is a label for which simulated GPU model this pool represents
-                  (e.g. "A100-mock-40GB"). Cosmetic only in this demo build.
+                  GPUModel is a free-text label for which GPU model this pool represents
+                  (e.g. "A100-40GB"). Cosmetic/informational only — it does not affect
+                  scheduling; GPUResourceName/GPUResourceQuantity do that.
+                type: string
+              gpuResourceName:
+                default: nvidia.com/gpu
+                description: |-
+                  GPUResourceName is the Kubernetes extended-resource key a Shared-tier
+                  actor pod requests, e.g. "nvidia.com/gpu" for a whole device via the
+                  NVIDIA device plugin, or a HAMi virtual-slice resource key (e.g.
+                  "nvidia.com/gpucores") for shared GPU slicing. Ignored for
+                  Backend=Exclusive.
+                type: string
+              gpuResourceQuantity:
+                default: "1"
+                description: |-
+                  GPUResourceQuantity is how much of GPUResourceName one admitted slot
+                  represents, e.g. "1" for a whole device or "25" for a HAMi
+                  core-percentage slice. Ignored for Backend=Exclusive.
                 type: string
               poolSize:
-                description: PoolSize is the number of warm GPU slots this pool maintains.
+                description: |-
+                  PoolSize is the number of concurrent GPU-bearing actors this pool
+                  admits. For Backend=Shared this is an admission budget (Kubernetes'
+                  own scheduler still does the real device binding). For
+                  Backend=Exclusive this must not exceed the referenced VFIOGPUPool's
+                  real device count.
                 format: int32
                 minimum: 1
                 type: integer
-              slotInitMillis:
-                default: 4000
+              vfioPoolRef:
                 description: |-
-                  SlotInitMillis simulates the one-time cost of standing up a single warm
-                  slot (device init, driver load, VRAM clear) when the pool is created or
-                  scaled up. This models the real "cold" GPU-provisioning path.
-                format: int32
-                type: integer
+                  VFIOPoolRef names the VFIOGPUPool (same namespace) this pool draws
+                  real physical devices from. Required for Backend=Exclusive, ignored
+                  otherwise.
+                type: string
             required:
             - poolSize
             type: object

@@ -28,10 +28,17 @@ type VMGPUAttachmentSpec struct {
 	DeviceRef string `json:"deviceRef,omitempty"`
 
 	// APISocket is the filesystem path to the target cloud-hypervisor
-	// instance's unix api-socket (e.g. /run/vc/vm/<id>/clh-api.sock, the
-	// same socket Substrate's own internal/ch package drives for
-	// pause/snapshot/resume).
-	APISocket string `json:"apiSocket"`
+	// instance's unix api-socket: /run/vc/vm/<actor-uid>/clh-api.sock,
+	// confirmed against agent-substrate's cmd/ateworker-microvm/internal/kata
+	// (the same path Substrate's own worker drives for pause/snapshot/
+	// resume). Keyed by actor UID, not by worker pod -- a worker pod reuses
+	// one VM lifecycle per actor it ever hosts, so this path changes every
+	// time a different actor resumes onto the same pod. Left empty until
+	// cmd/substrate-gpu-bridge resolves the currently-assigned actor's UID;
+	// it is written together with DesiredState (never DesiredState=Attached
+	// with a stale or empty socket from a previous actor).
+	// +optional
+	APISocket string `json:"apiSocket,omitempty"`
 
 	// DesiredState drives the reconciler: Attached hot-adds the acquired
 	// device into the guest at APISocket; Detached hot-removes it and

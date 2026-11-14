@@ -48,18 +48,17 @@ func init() {
 func main() {
 	kubectlAteBin := flag.String("kubectl-ate-bin", "kubectl-ate", "path to the kubectl-ate binary")
 	kubectlAteKubeconfig := flag.String("kubectl-ate-kubeconfig", "", "if set, passed to kubectl-ate as --kubeconfig (Substrate's own control-plane kubeconfig)")
-	atespace := flag.String("atespace", "", "the actor's atespace (required)")
-	actorName := flag.String("actor", "", "the actor name to watch (required)")
+	atespace := flag.String("atespace", "", "the atespace to watch for whichever actor is currently assigned to -pod-name (required)")
 	namespace := flag.String("namespace", "", "namespace of the HAMi-shared pod and FluidCR objects (required)")
-	podName := flag.String("pod-name", "", "name of the HAMi-shared pod to manage (required)")
+	podName := flag.String("pod-name", "", "name of the HAMi-shared pod to manage; also the worker pod name actor assignments are matched against, since a pod hosts actors sequentially, not just the one it started with (required)")
 	containerName := flag.String("container-name", "", "the GPU-using container within the pod (required)")
 	podSpecFile := flag.String("pod-spec-file", "", "path to a YAML file holding the corev1.PodSpec used both to create the pod fresh and as the FluidCRRestore template (required)")
 	pollInterval := flag.Duration("poll-interval", time.Second, "how often to poll the actor's state")
 	fluidcrPollInterval := flag.Duration("fluidcr-poll-interval", 2*time.Second, "how often to poll a FluidCRCheckpoint/FluidCRRestore's phase while waiting for it to finish")
 	flag.Parse()
 
-	if *atespace == "" || *actorName == "" || *namespace == "" || *podName == "" || *containerName == "" || *podSpecFile == "" {
-		fmt.Fprintln(os.Stderr, "all of -atespace, -actor, -namespace, -pod-name, -container-name, -pod-spec-file are required")
+	if *atespace == "" || *namespace == "" || *podName == "" || *containerName == "" || *podSpecFile == "" {
+		fmt.Fprintln(os.Stderr, "all of -atespace, -namespace, -pod-name, -container-name, -pod-spec-file are required")
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -85,7 +84,7 @@ func main() {
 	fetcher := &substratebridge.KubectlAteFetcher{
 		Binary:     *kubectlAteBin,
 		Atespace:   *atespace,
-		ActorName:  *actorName,
+		WorkerPod:  *podName,
 		Kubeconfig: *kubectlAteKubeconfig,
 	}
 	driver := &hamilifecycle.Driver{
@@ -100,8 +99,8 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	log.Printf("hami-substrate-bridge watching actor %s/%s, driving pod %s/%s, every %s",
-		*atespace, *actorName, *namespace, *podName, *pollInterval)
+	log.Printf("hami-substrate-bridge watching atespace %s for whichever actor is assigned to pod %s/%s, driving it, every %s",
+		*atespace, *namespace, *podName, *pollInterval)
 
 	hamilifecycle.Run(ctx, fetcher, driver, *pollInterval,
 		func(t hamilifecycle.Transition) {

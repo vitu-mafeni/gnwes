@@ -44,9 +44,7 @@ func main() {
 	poolSize := flag.Int("pool-size", 3, "warm pool size (deliberately small to force contention)")
 	actors := flag.Int("actors", 40, "total number of actors to cycle through")
 	concurrency := flag.Int("concurrency", 10, "number of actors in flight at once")
-	slotInitMs := flag.Int("slot-init-ms", 300, "simulated slot init cost (kept small so the run finishes quickly)")
-	attachMs := flag.Int("attach-ms", 20, "simulated attach cost")
-	holdMs := flag.Int("hold-ms", 15, "simulated time each actor holds its slot")
+	holdMs := flag.Int("hold-ms", 15, "time each actor holds its lease before releasing")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -58,8 +56,8 @@ func main() {
 
 	const poolName = "loadtest-pool"
 	must(deletePoolIfExists(ctx, c, *namespace, poolName), "cleaning up any previous pool")
-	must(createPool(ctx, c, *namespace, poolName, int32(*poolSize), int32(*slotInitMs), int32(*attachMs)), "creating pool")
-	must(waitPoolReady(ctx, c, *namespace, poolName, 60*time.Second), "waiting for pool to warm up")
+	must(createPool(ctx, c, *namespace, poolName, int32(*poolSize)), "creating pool")
+	must(waitPoolReady(ctx, c, *namespace, poolName, 60*time.Second), "waiting for pool to be ready")
 	fmt.Printf("pool %q ready with %d slots; racing %d actors (concurrency=%d)\n", poolName, *poolSize, *actors, *concurrency)
 
 	monitorCtx, stopMonitor := context.WithCancel(ctx)
@@ -201,12 +199,11 @@ func ensureNamespace(ctx context.Context, c client.Client, ns string) error {
 	return err
 }
 
-func createPool(ctx context.Context, c client.Client, ns, name string, size, slotInitMs, attachMs int32) error {
+func createPool(ctx context.Context, c client.Client, ns, name string, size int32) error {
 	return c.Create(ctx, &gnwesv1alpha1.GPUWorkerPool{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec: gnwesv1alpha1.GPUWorkerPoolSpec{
-			PoolSize: size, GPUModel: "A100-mock-40GB",
-			SlotInitMillis: slotInitMs, AttachLatencyMillis: attachMs,
+			PoolSize: size, GPUModel: "A100-40GB",
 		},
 	})
 }

@@ -1,5 +1,11 @@
 # GNWES ↔ real Agent Substrate integration
 
+**For a single, step-by-step reproducible walkthrough** (kernel upgrade
+through GNWES integration, plus an explicit "is this simulated?" and
+limitations section), see [`REPRODUCTION-GUIDE.md`](REPRODUCTION-GUIDE.md).
+This README stays focused on what the integration proves and why it needs
+no Substrate source changes.
+
 This is the real thing, not a simulation of it: GNWES gating and leasing a
 genuine [agent-substrate/substrate](https://github.com/agent-substrate/substrate)
 worker pod, with a real Substrate actor repeatedly resuming onto that exact
@@ -7,6 +13,22 @@ pod. Verified end-to-end on 2026-11-11 against a local `kind` cluster running
 Substrate's real control plane (`ate-system`: `ate-api-server`,
 `ate-controller`, `ate-idp-server`, `atelet`, `atenet`, `postgres`, `rustfs`)
 built from an unmodified clone of the upstream repo.
+
+**Reproduced again on real hardware (2026-11-13)**, against `server1` /
+`dcn-gpu-0` (see `INSTALL-ON-REAL-CLUSTER.md` for that cluster's install
+history) -- same result, same mechanism, zero changes to this integration's
+own logic: webhook gates the pod on CREATE (`SchedulingGated`), the manager
+reserves a slot and removes the gate (`"pod admitted: GPU slot reserved
+ahead of scheduling"`, `slot: mock-gpu-0`), the pod schedules and runs, a
+`GPULease` targeting that exact pod binds to the same slot via
+`pool.Transfer` (no second acquire), and `kubectl-ate resume actor` lands a
+real actor on that exact pod (`ACTOR_STATE_RUNNING`). The only things that
+differed from the kind run were purely environmental and already documented
+elsewhere: building `podgate-webhook`'s image needed `CGO_ENABLED=0` (static
+linking, since the base image `gcr.io/distroless/static:nonroot` has no
+dynamic linker) and fresh TLS certs matching this cluster's own Service DNS
+name (`hack/gencert.go gnwes-podgate-webhook.ate-demo-counter.svc`) -- kind's
+own build tooling had quietly handled both for the original run.
 
 ## Why a webhook, and why that's still "no Substrate source changes"
 
@@ -48,6 +70,17 @@ generic; only the webhook is Substrate-specific.
    involvement needed — Substrate's own fast resume path does the rest.
 
 ## What this is honest about NOT proving
+
+**Historical note (2026-11-13): this section described the state of the
+code on 2026-11-11/12, when `GPUWorkerPool`/`GPULease`'s attach step really
+was a `time.Sleep` + pod annotation. That mock pool no longer exists —
+`internal/pool` now does real Kubernetes-scheduled GPU admission
+(Backend=Shared) or defers to real VFIO hot-attach driven by
+`cmd/substrate-gpu-bridge` (Backend=Exclusive). See
+[`REPRODUCTION-GUIDE.md`](REPRODUCTION-GUIDE.md)'s "Is this real, or
+simulated?" and "Known limitations" sections for the current, accurate
+picture — the bullets below are kept for the historical record of what this
+specific 2026-11-11 kind-cluster run did and didn't prove at the time.**
 
 - **No real CDI injection.** The attach step is still a sleep + annotation,
   exactly as in the simulated demo. Wiring a real `cdiinject.IntoBundle` call

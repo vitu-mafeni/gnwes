@@ -205,6 +205,10 @@ func (d *Driver) restoreFrom(ctx context.Context, cp *savedCheckpoint) error {
 	}
 }
 
+// fetchActorStateTimeout bounds one FetchActorState call within Run's tick
+// -- see substratebridge.tickTimeout's doc comment for why this is needed.
+const fetchActorStateTimeout = 15 * time.Second
+
 // Transition is one applied state change, for logging.
 type Transition struct {
 	ActorState string
@@ -218,13 +222,23 @@ func Run(ctx context.Context, fetcher substratebridge.ActorStateFetcher, driver 
 	var lastRunning *bool
 
 	tick := func() {
-		actorState, err := fetcher.FetchActorState(ctx)
+		// Same hang this package's Run shares with substratebridge.Run: a
+		// stuck kubectl-ate invocation (e.g. a stalled port-forward dial)
+		// has no deadline of its own, so it would otherwise block this
+		// whole tick -- and this loop's single goroutine -- forever.
+		// EnsureRunning/EnsureSuspended below intentionally get no such
+		// timeout: a checkpoint/restore cycle is expected to take seconds
+		// and must run to completion, not be cut off mid-operation.
+		fetchCtx, cancel := context.WithTimeout(ctx, fetchActorStateTimeout)
+		obs, err := fetcher.FetchActorState(fetchCtx)
+		cancel()
 		if err != nil {
 			if onError != nil {
 				onError(fmt.Errorf("fetching actor state: %w", err))
 			}
 			return
 		}
+		actorState := obs.State
 		wantRunning := substratebridge.DesiredStateForActorState(actorState) == gnwesv1alpha1.VMGPUDesiredAttached
 
 		if lastRunning != nil && *lastRunning == wantRunning {

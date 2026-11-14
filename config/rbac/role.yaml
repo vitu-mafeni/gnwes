@@ -19,6 +19,8 @@ rules:
   resources:
   - gpuleases
   - gpuworkerpools
+  - vfiogpupools
+  - vmgpuattachments
   verbs:
   - create
   - delete
@@ -32,6 +34,8 @@ rules:
   resources:
   - gpuleases/status
   - gpuworkerpools/status
+  - vfiogpupools/status
+  - vmgpuattachments/status
   verbs:
   - get
   - patch

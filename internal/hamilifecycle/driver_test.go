@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"gnwes/internal/fluidcrclient"
+	"gnwes/internal/substratebridge"
 )
 
 func testScheme(t *testing.T) *runtime.Scheme {
@@ -244,10 +245,10 @@ type fakeFetcher struct {
 	state string
 }
 
-func (f *fakeFetcher) FetchActorState(context.Context) (string, error) {
+func (f *fakeFetcher) FetchActorState(context.Context) (substratebridge.ActorObservation, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.state, nil
+	return substratebridge.ActorObservation{State: f.state}, nil
 }
 
 func (f *fakeFetcher) setState(s string) {

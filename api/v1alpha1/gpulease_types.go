@@ -4,19 +4,22 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// GPULeaseSpec requests that one warm slot from PoolRef be attached to
-// TargetPod for the lifetime of this lease. This is the "lease a GPU by the
-// second" primitive: creating it attaches a slot in sub-second time, deleting
-// it (or letting the TTL expire) detaches and returns the slot to the pool
-// for immediate reuse by the next actor.
+// GPULeaseSpec requests that one unit of real GPU capacity from PoolRef be
+// bound to TargetPod for the lifetime of this lease. What "bound" means
+// depends on the referenced GPUWorkerPool's Backend:
+//   - Shared: TargetPod's real GPU resource request (already present on its
+//     spec since pod creation) is admitted against the pool's budget; this
+//     lease records which real node/resource Kubernetes actually bound.
+//   - Exclusive: a real physical GPU is live hot-attached via VFIO into
+//     TargetPod's already-running microVM guest (no restart). Deleting this
+//     lease (or letting the TTL expire) hot-detaches it and returns the
+//     device to the pool for immediate reuse by the next actor.
 type GPULeaseSpec struct {
 	// PoolRef is the name of the GPUWorkerPool (same namespace) to lease from.
 	PoolRef string `json:"poolRef"`
 
-	// TargetPod is the name of the actor pod (same namespace) the leased slot
-	// is attached to. In this demo build "attach" means annotating the pod
-	// with the assigned slot id, simulating CDI device injection into an
-	// already-running sandbox.
+	// TargetPod is the name of the actor pod (same namespace) the lease
+	// binds real GPU capacity to.
 	TargetPod string `json:"targetPod"`
 
 	// TTLSeconds, if set, auto-releases the lease this many seconds after it
@@ -36,15 +39,26 @@ const (
 	LeasePhaseFailed    GPULeasePhase = "Failed"
 )
 
-// GPULeaseStatus reports the outcome of the attach/detach flow, including the
-// measured attach latency the demo uses as its headline number.
+// GPULeaseStatus reports the outcome of the attach/detach flow, including
+// the REAL measured attach latency (wall-clock, no injected delay).
 type GPULeaseStatus struct {
 	// +optional
 	Phase GPULeasePhase `json:"phase,omitempty"`
 
-	// SlotID is the warm pool slot assigned to this lease once Bound.
+	// SlotID identifies the real GPU capacity bound once Bound: for
+	// Backend=Shared, "<node>/<resourceName>" for the node and extended
+	// resource Kubernetes actually scheduled; for Backend=Exclusive, the
+	// real VFIOGPUPool device ID that was hot-attached. This is a
+	// human-facing descriptor; it is not necessarily the key GNWES itself
+	// uses to release capacity — see AdmissionTicket.
 	// +optional
 	SlotID string `json:"slotID,omitempty"`
+
+	// AdmissionTicket is GNWES's own internal admission-budget ticket ID
+	// (Backend=Shared only; see internal/pool). It is not a device
+	// identity — SlotID is the human-facing real node/resource descriptor.
+	// +optional
+	AdmissionTicket string `json:"admissionTicket,omitempty"`
 
 	// +optional
 	RequestedAt *metav1.Time `json:"requestedAt,omitempty"`
@@ -72,7 +86,8 @@ type GPULeaseStatus struct {
 // +kubebuilder:printcolumn:name="AttachMs",type=integer,JSONPath=`.status.attachLatencyMillis`
 // +kubebuilder:resource:shortName=gl
 
-// GPULease is a request to attach one warm GPU slot to a running actor pod.
+// GPULease is a request to bind one unit of real GPU capacity to an actor
+// pod. See GPULeaseSpec's doc comment for what "bind" means per backend.
 type GPULease struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

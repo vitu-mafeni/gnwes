@@ -16,6 +16,17 @@
 # resolve it the same way demos/counter does (ko resolve / ate-setup's own
 # demo-image resolution) before applying — do not hardcode a resolved
 # sha256 digest here, that ties this file to one local registry's state.
+#
+# template.resources.limits["nvidia.com/gpu"] is the REAL Kubernetes
+# extended-resource request that makes this a genuinely GPU-scheduled pod
+# (Backend=Shared's whole point — see gnwes-counter-pool.yaml). This is
+# confirmed to flow straight through to the real pod spec with zero
+# Substrate source changes (agent-substrate's workerpool_apply.go passes
+# template.resources through unfiltered). It needs a real device plugin (the
+# NVIDIA device plugin) or HAMi actually installed and advertising this
+# resource on at least one node, or the pod will stay Pending forever —
+# remove this block (and PoolSize's corresponding admission budget) to run
+# this demo on a cluster with no GPU at all.
 apiVersion: ate.dev/v1
 kind: WorkerPool
 metadata:
@@ -35,6 +46,7 @@ spec:
       limits:
         cpu: "1"
         memory: 1Gi
+        nvidia.com/gpu: "1"
       requests:
         cpu: 250m
         memory: 1Gi

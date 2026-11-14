@@ -4,13 +4,16 @@ import (
 	"context"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	gnwesv1alpha1 "gnwes/api/v1alpha1"
 	"gnwes/internal/pool"
 )
 
@@ -29,7 +32,7 @@ const (
 	// annoReservedSlot records the slot this controller reserved for the pod
 	// ahead of scheduling. The GPULease created for the pod afterwards
 	// inherits (Transfers) this reservation instead of acquiring a second,
-	// independent slot.
+	// independent slot. Backend=Shared only.
 	annoReservedSlot = "gnwes.io/reserved-slot"
 
 	gateFinalizer = "gnwes.io/gate-cleanup"
@@ -49,6 +52,7 @@ type PodGateReconciler struct {
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=gnwes.io,resources=gpuworkerpools;vfiogpupools,verbs=get;list;watch
 
 func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -75,6 +79,15 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, r.Update(ctx, &pod)
 	}
 
+	var wp gnwesv1alpha1.GPUWorkerPool
+	if err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: poolRef}, &wp); err != nil {
+		return ctrl.Result{RequeueAfter: 250 * time.Millisecond}, client.IgnoreNotFound(err)
+	}
+
+	if wp.Spec.Backend == gnwesv1alpha1.BackendExclusive {
+		return r.admitExclusive(ctx, &pod, &wp, reservationKey, logger)
+	}
+
 	p := r.Manager.GetPool(req.Namespace + "/" + poolRef)
 	if p == nil {
 		return ctrl.Result{RequeueAfter: 250 * time.Millisecond}, nil
@@ -97,7 +110,35 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("pod admitted: GPU slot reserved ahead of scheduling", "pod", req.String(), "pool", poolRef, "slot", slotID)
+	logger.Info("pod admitted: GPU budget ticket reserved ahead of scheduling", "pod", req.String(), "pool", poolRef, "ticket", slotID)
+	return ctrl.Result{}, nil
+}
+
+// admitExclusive gates admission on the referenced VFIOGPUPool's REAL
+// available-device count — no in-memory bookkeeping, since VFIOGPUPoolReconciler
+// already mirrors live vfiopool.Manager state into that CR's status. This
+// only bounds how many microVM worker pods get admitted; the actual device
+// hot-attach happens later, driven by GPULeaseReconciler.
+func (r *PodGateReconciler) admitExclusive(ctx context.Context, pod *corev1.Pod, wp *gnwesv1alpha1.GPUWorkerPool, reservationKey string, logger logr.Logger) (ctrl.Result, error) {
+	if wp.Spec.VFIOPoolRef == "" {
+		logger.Info("GPUWorkerPool is Backend=Exclusive but has no vfioPoolRef; removing gate with no reservation", "pool", wp.Name)
+		removeGate(pod)
+		return ctrl.Result{}, r.Update(ctx, pod)
+	}
+	var vfioPool gnwesv1alpha1.VFIOGPUPool
+	if err := r.Get(ctx, types.NamespacedName{Namespace: wp.Namespace, Name: wp.Spec.VFIOPoolRef}, &vfioPool); err != nil {
+		return ctrl.Result{RequeueAfter: 250 * time.Millisecond}, client.IgnoreNotFound(err)
+	}
+	if vfioPool.Status.AvailableDevices < 1 {
+		return ctrl.Result{RequeueAfter: 250 * time.Millisecond}, nil
+	}
+
+	controllerutil.AddFinalizer(pod, gateFinalizer)
+	removeGate(pod)
+	if err := r.Update(ctx, pod); err != nil {
+		return ctrl.Result{}, err
+	}
+	logger.Info("pod admitted: real VFIO device capacity available in pool", "pod", pod.Namespace+"/"+pod.Name, "vfioPool", vfioPool.Name, "available", vfioPool.Status.AvailableDevices)
 	return ctrl.Result{}, nil
 }
 

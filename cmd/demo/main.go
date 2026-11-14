@@ -1,9 +1,15 @@
-// Command demo drives the GNWES control plane to produce the headline
-// NeoCloudCon number: how fast a GPU slot attaches to an already-running
-// actor out of a warm pool, versus standing a dedicated slot up from scratch
-// for every single actor ("cold" path, today's default on most clusters).
+// Command demo drives the GNWES control plane against a real,
+// Kubernetes-scheduled GPU resource (Backend=Shared): how fast a GPULease
+// binds against an already-admitted pool's budget, versus standing up a
+// brand-new single-ticket pool and pod from scratch for every single actor
+// ("cold" path, today's default on most clusters). Both numbers are real
+// wall-clock time against the real scheduler and device plugin/HAMi — there
+// is no injected delay on either path.
 //
-// Requires: CRDs installed and cmd/manager running against the same cluster.
+// Requires: CRDs installed and cmd/manager running against the same cluster,
+// plus a real GPU device plugin (or HAMi) actually installed if you want
+// GPUResourceName/GPUResourceQuantity on the pool's pods to bind to
+// anything — otherwise the pods will stay Pending until one is.
 package main
 
 import (
@@ -16,6 +22,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -48,11 +55,11 @@ func main() {
 	mode := flag.String("mode", "both", "warm | cold | both")
 	namespace := flag.String("namespace", "gnwes-demo", "namespace to run the demo in")
 	actors := flag.Int("actors", 8, "number of ephemeral actors to cycle through")
-	poolSize := flag.Int("pool-size", 3, "warm pool size (warm mode only)")
-	slotInitMs := flag.Int("slot-init-ms", 4000, "simulated one-time cost to stand up one GPU slot")
-	attachMs := flag.Int("attach-ms", 150, "simulated CDI-injection attach cost")
+	poolSize := flag.Int("pool-size", 3, "warm pool admission budget (warm mode only)")
 	workMs := flag.Int("work-ms", 100, "simulated time each actor spends doing GPU work before releasing")
 	gate := flag.Bool("gate", true, "hold each actor pod un-schedulable (scheduling gate) until a GPU slot is actually reserved for it")
+	gpuResourceName := flag.String("gpu-resource-name", "nvidia.com/gpu", "real Kubernetes extended-resource key each actor pod requests; needs a real device plugin or HAMi installed to ever bind")
+	gpuResourceQty := flag.String("gpu-resource-qty", "1", "quantity of gpu-resource-name each actor pod requests")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -66,11 +73,11 @@ func main() {
 
 	opts := demoOpts{
 		c: c, ns: *namespace, actors: *actors,
-		poolSize:   int32(*poolSize),
-		slotInitMs: int32(*slotInitMs),
-		attachMs:   int32(*attachMs),
-		workMs:     time.Duration(*workMs) * time.Millisecond,
-		gate:       *gate,
+		poolSize:        int32(*poolSize),
+		workMs:          time.Duration(*workMs) * time.Millisecond,
+		gate:            *gate,
+		gpuResourceName: *gpuResourceName,
+		gpuResourceQty:  *gpuResourceQty,
 	}
 	if *gate {
 		fmt.Println("scheduling gate: ON — actor pods are held un-schedulable until a GPU slot is reserved for them")
@@ -103,21 +110,23 @@ func main() {
 }
 
 type demoOpts struct {
-	c          client.Client
-	ns         string
-	actors     int
-	poolSize   int32
-	slotInitMs int32
-	attachMs   int32
-	workMs     time.Duration
-	gate       bool
+	c               client.Client
+	ns              string
+	actors          int
+	poolSize        int32
+	workMs          time.Duration
+	gate            bool
+	gpuResourceName string
+	gpuResourceQty  string
 }
 
 // podTimeout bounds how long we'll wait for an actor pod to reach Running.
-// With gating on, that wait includes however long it takes a slot to free up
-// (up to a full slotInitMs for a cold, just-created pool), so scale with it.
+// This now covers a REAL Kubernetes scheduling + device-plugin/HAMi GPU
+// binding cost (and, on a cold cluster, an image pull), not a simulated
+// delay — generous enough to cover a cold image pull on a freshly admitted
+// node.
 func (o demoOpts) podTimeout() time.Duration {
-	return time.Duration(o.slotInitMs)*time.Millisecond + 25*time.Second
+	return 90 * time.Second
 }
 
 // runWarm stands up ONE pool once, then cycles every actor's lease through
@@ -127,17 +136,17 @@ func runWarm(ctx context.Context, o demoOpts) []time.Duration {
 	must(deletePoolIfExists(ctx, o.c, o.ns, poolName), "cleaning up previous pool")
 
 	warmup := timeIt(func() {
-		must(createPool(ctx, o.c, o.ns, poolName, o.poolSize, o.slotInitMs, o.attachMs), "creating warm pool")
-		must(waitPoolReady(ctx, o.c, o.ns, poolName, 60*time.Second), "waiting for pool to warm up")
+		must(createPool(ctx, o.c, o.ns, poolName, o.poolSize, o.gpuResourceName, o.gpuResourceQty), "creating warm pool")
+		must(waitPoolReady(ctx, o.c, o.ns, poolName, 60*time.Second), "waiting for pool to be ready")
 	})
-	fmt.Printf("pool warm-up (one-time, paid ahead of any actor): %s for %d slots\n", fmtMs(warmup), o.poolSize)
+	fmt.Printf("pool admission budget provisioned (one-time, paid ahead of any actor): %s for %d tickets\n", fmtMs(warmup), o.poolSize)
 
 	latencies := make([]time.Duration, 0, o.actors)
 	for i := 1; i <= o.actors; i++ {
 		podName := fmt.Sprintf("actor-%d", i)
 		leaseName := fmt.Sprintf("actor-%d-lease", i)
 
-		must(createActorPod(ctx, o.c, o.ns, podName, poolName, o.gate), "creating actor pod")
+		must(createActorPod(ctx, o.c, o.ns, podName, poolName, o.gate, o.gpuResourceName, o.gpuResourceQty), "creating actor pod")
 		must(waitPodRunning(ctx, o.c, o.ns, podName, o.podTimeout()), "waiting for actor pod to run")
 
 		start := time.Now()
@@ -171,13 +180,13 @@ func runCold(ctx context.Context, o demoOpts) []time.Duration {
 		leaseName := fmt.Sprintf("cold-actor-%d-lease", i)
 
 		start := time.Now()
-		must(createPool(ctx, o.c, o.ns, poolName, 1, o.slotInitMs, o.attachMs), "creating dedicated pool")
+		must(createPool(ctx, o.c, o.ns, poolName, 1, o.gpuResourceName, o.gpuResourceQty), "creating dedicated pool")
 		// Pod is created right away, before the pool has warmed up. With
 		// gating on, the pod simply sits un-schedulable until the pool's one
 		// slot is ready and reserved for it — no separate wait needed. With
 		// gating off, nothing stops the pod from running immediately, so we
 		// fall back to explicitly waiting for the pool instead.
-		must(createActorPod(ctx, o.c, o.ns, podName, poolName, o.gate), "creating actor pod")
+		must(createActorPod(ctx, o.c, o.ns, podName, poolName, o.gate, o.gpuResourceName, o.gpuResourceQty), "creating actor pod")
 		if !o.gate {
 			must(waitPoolReady(ctx, o.c, o.ns, poolName, 60*time.Second), "waiting for dedicated pool")
 		}
@@ -210,14 +219,14 @@ func ensureNamespace(ctx context.Context, c client.Client, ns string) error {
 	return err
 }
 
-func createPool(ctx context.Context, c client.Client, ns, name string, size, slotInitMs, attachMs int32) error {
+func createPool(ctx context.Context, c client.Client, ns, name string, size int32, gpuResourceName, gpuResourceQty string) error {
 	p := &gnwesv1alpha1.GPUWorkerPool{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec: gnwesv1alpha1.GPUWorkerPoolSpec{
 			PoolSize:            size,
-			GPUModel:            "A100-mock-40GB",
-			SlotInitMillis:      slotInitMs,
-			AttachLatencyMillis: attachMs,
+			GPUModel:            "A100-40GB",
+			GPUResourceName:     gpuResourceName,
+			GPUResourceQuantity: gpuResourceQty,
 		},
 	}
 	return c.Create(ctx, p)
@@ -247,16 +256,24 @@ func deletePoolIfExists(ctx context.Context, c client.Client, ns, name string) e
 
 // createActorPod makes a minimal pod using the pause image, which kind
 // preloads on every node, so no image pull is needed for the demo to run.
-// When gated, the pod carries the gnwes.io/gpu-capacity scheduling gate and
-// is held un-schedulable until PodGateReconciler reserves it a slot in
-// poolRef.
-func createActorPod(ctx context.Context, c client.Client, ns, name, poolRef string, gated bool) error {
+// It requests a real gpuResourceName/gpuResourceQty extended resource, so
+// this only ever reaches Running on a cluster where that resource is real
+// (a real device plugin or HAMi is installed) — there is no fallback that
+// fakes a GPU being present. When gated, the pod carries the
+// gnwes.io/gpu-capacity scheduling gate and is held un-schedulable until
+// PodGateReconciler admits it against poolRef's real budget.
+func createActorPod(ctx context.Context, c client.Client, ns, name, poolRef string, gated bool, gpuResourceName, gpuResourceQty string) error {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: map[string]string{"app": "gnwes-demo-actor"}},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{
 				Name:  "actor",
 				Image: "registry.k8s.io/pause:3.9",
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceName(gpuResourceName): resource.MustParse(gpuResourceQty),
+					},
+				},
 			}},
 		},
 	}

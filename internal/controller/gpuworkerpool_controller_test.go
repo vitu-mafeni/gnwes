@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"testing"
-	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -13,14 +12,49 @@ import (
 	"gnwes/internal/pool"
 )
 
-func TestGPUWorkerPoolReconcile_WarmsUpThenReady(t *testing.T) {
+// TestGPUWorkerPoolReconcile_ExclusiveCreatesAttachmentWithEmptyAPISocket is
+// the regression test for the fix to the stale-socket bug: a microVM worker
+// pod reuses its VM lifecycle across many sequential actors, so there is no
+// correct socket path to seed at VMGPUAttachment creation time (unlike the
+// old static gnwes.io/ch-api-socket annotation this reconciler used to
+// require). The attachment must still be created right away, with an empty
+// apiSocket -- cmd/substrate-gpu-bridge fills it in once it resolves which
+// actor is actually assigned to this pod.
+func TestGPUWorkerPoolReconcile_ExclusiveCreatesAttachmentWithEmptyAPISocket(t *testing.T) {
+	wp := exclusivePool("pool-x", "ns", "vfio-pool-a")
+	vfioPool := &gnwesv1alpha1.VFIOGPUPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "vfio-pool-a", Namespace: "ns"},
+		Status:     gnwesv1alpha1.VFIOGPUPoolStatus{TotalDevices: 1, AvailableDevices: 1},
+	}
+	pod := newTestPod("worker-1", "ns")
+	pod.Labels = map[string]string{labelPoolRef: "pool-x"}
+	c := newFakeClient(t, wp, vfioPool, pod)
+	r := &GPUWorkerPoolReconciler{Client: c, Scheme: testScheme(t), Manager: pool.NewManager()}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "pool-x", Namespace: "ns"}}
+
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	var att gnwesv1alpha1.VMGPUAttachment
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "worker-1", Namespace: "ns"}, &att); err != nil {
+		t.Fatalf("expected a VMGPUAttachment to be created immediately, got: %v", err)
+	}
+	if att.Spec.APISocket != "" {
+		t.Fatalf("expected an empty apiSocket at creation (bridge-managed), got %q", att.Spec.APISocket)
+	}
+	if att.Spec.DesiredState != gnwesv1alpha1.VMGPUDesiredDetached {
+		t.Fatalf("expected DesiredState Detached at creation, got %q", att.Spec.DesiredState)
+	}
+	if att.Spec.PoolRef != "vfio-pool-a" {
+		t.Fatalf("expected poolRef vfio-pool-a, got %q", att.Spec.PoolRef)
+	}
+}
+
+func TestGPUWorkerPoolReconcile_SharedIsReadyImmediately(t *testing.T) {
 	wp := &gnwesv1alpha1.GPUWorkerPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "ns"},
-		Spec: gnwesv1alpha1.GPUWorkerPoolSpec{
-			PoolSize:            2,
-			SlotInitMillis:      20,
-			AttachLatencyMillis: 10,
-		},
+		Spec:       gnwesv1alpha1.GPUWorkerPoolSpec{PoolSize: 2},
 	}
 	c := newFakeClient(t, wp)
 	r := &GPUWorkerPoolReconciler{Client: c, Manager: pool.NewManager()}
@@ -30,28 +64,11 @@ func TestGPUWorkerPoolReconcile_WarmsUpThenReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if res.RequeueAfter == 0 {
-		t.Fatalf("expected a requeue while warming")
+	if res.RequeueAfter != 0 {
+		t.Fatalf("expected no requeue: there is no warm-up delay to simulate any more")
 	}
 
 	var got gnwesv1alpha1.GPUWorkerPool
-	if err := c.Get(context.Background(), req.NamespacedName, &got); err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	if got.Status.Phase != gnwesv1alpha1.PoolPhaseWarming {
-		t.Fatalf("expected phase Warming immediately after creation, got %q", got.Status.Phase)
-	}
-
-	time.Sleep(40 * time.Millisecond)
-
-	res, err = r.Reconcile(context.Background(), req)
-	if err != nil {
-		t.Fatalf("second reconcile: %v", err)
-	}
-	if res.RequeueAfter != 0 {
-		t.Fatalf("expected no further requeue once Ready")
-	}
-
 	if err := c.Get(context.Background(), req.NamespacedName, &got); err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -83,7 +100,7 @@ func TestGPUWorkerPoolReconcile_DeleteClearsManagerState(t *testing.T) {
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "gone", Namespace: "ns"}}
 
 	// Pre-populate manager state as if the pool had existed before.
-	mgr.EnsurePool("ns/gone", "model", 100, 10).Resize(1)
+	mgr.EnsurePool("ns/gone", "model").Resize(1)
 	if mgr.GetPool("ns/gone") == nil {
 		t.Fatalf("setup: expected pool to exist in the manager")
 	}
@@ -97,10 +114,10 @@ func TestGPUWorkerPoolReconcile_DeleteClearsManagerState(t *testing.T) {
 	}
 }
 
-func TestGPUWorkerPoolReconcile_DefaultsAppliedWhenUnset(t *testing.T) {
+func TestGPUWorkerPoolReconcile_ZeroPoolSizeIsValid(t *testing.T) {
 	wp := &gnwesv1alpha1.GPUWorkerPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "pool-b", Namespace: "ns"},
-		Spec:       gnwesv1alpha1.GPUWorkerPoolSpec{PoolSize: 0}, // SlotInitMillis/AttachLatencyMillis left zero
+		Spec:       gnwesv1alpha1.GPUWorkerPoolSpec{PoolSize: 0},
 	}
 	c := newFakeClient(t, wp)
 	mgr := pool.NewManager()
@@ -115,7 +132,7 @@ func TestGPUWorkerPoolReconcile_DefaultsAppliedWhenUnset(t *testing.T) {
 	if p == nil {
 		t.Fatalf("expected a pool to be created even with PoolSize 0")
 	}
-	if p.SlotInitMillis != 4000 || p.AttachLatencyMillis != 150 {
-		t.Fatalf("expected documented defaults (4000/150), got slotInit=%d attach=%d", p.SlotInitMillis, p.AttachLatencyMillis)
+	if total, _, _ := p.Counts(); total != 0 {
+		t.Fatalf("expected zero tickets, got %d", total)
 	}
 }

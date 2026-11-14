@@ -4,191 +4,161 @@ import (
 	"fmt"
 	"sync"
 	"testing"
-	"time"
 )
 
-func newTestPool(t *testing.T, slotInitMillis int32) *Pool {
+func newTestPool(t *testing.T) *Pool {
 	t.Helper()
 	m := NewManager()
-	return m.EnsurePool("ns/test-pool", "mock-model", slotInitMillis, 10)
+	return m.EnsurePool("ns/test-pool", "mock-model")
 }
 
-func TestResizeGrowsAsInitializing(t *testing.T) {
-	p := newTestPool(t, 10_000) // long enough that nothing promotes mid-test
-	added := p.Resize(3)
-	if len(added) != 3 {
-		t.Fatalf("expected 3 newly added slots, got %d", len(added))
-	}
-	total, available, leased, initializing := p.Counts()
-	if total != 3 || available != 0 || leased != 0 || initializing != 3 {
-		t.Fatalf("got total=%d available=%d leased=%d initializing=%d, want 3/0/0/3", total, available, leased, initializing)
+func TestResizeGrowsImmediately(t *testing.T) {
+	p := newTestPool(t)
+	p.Resize(3)
+	total, available, leased := p.Counts()
+	if total != 3 || available != 3 || leased != 0 {
+		t.Fatalf("got total=%d available=%d leased=%d, want 3/3/0", total, available, leased)
 	}
 }
 
 func TestResizeIsIdempotentAtSameTarget(t *testing.T) {
-	p := newTestPool(t, 10_000)
+	p := newTestPool(t)
 	p.Resize(2)
-	added := p.Resize(2)
-	if len(added) != 0 {
-		t.Fatalf("resizing to the same target should add nothing, got %d", len(added))
-	}
-	total, _, _, _ := p.Counts()
+	p.Resize(2)
+	total, _, _ := p.Counts()
 	if total != 2 {
 		t.Fatalf("expected total=2, got %d", total)
 	}
 }
 
-func TestSlotPromotesToAvailableAfterInitDelay(t *testing.T) {
-	p := newTestPool(t, 20) // 20ms simulated init cost
-	p.Resize(1)
-
-	_, available, _, initializing := p.Counts()
-	if available != 0 || initializing != 1 {
-		t.Fatalf("expected the slot to still be initializing immediately, got available=%d initializing=%d", available, initializing)
-	}
-
-	time.Sleep(40 * time.Millisecond)
-
-	_, available, _, initializing = p.Counts()
-	if available != 1 || initializing != 0 {
-		t.Fatalf("expected the slot to have promoted to available, got available=%d initializing=%d", available, initializing)
-	}
-}
-
-func TestResizeShrinkOnlyRemovesAvailableSlots(t *testing.T) {
-	p := newTestPool(t, 1) // promotes to available almost immediately
+func TestResizeShrinkOnlyRemovesAvailableTickets(t *testing.T) {
+	p := newTestPool(t)
 	p.Resize(2)
-	time.Sleep(10 * time.Millisecond) // let both slots become available
 
-	slotID, ok := p.Acquire("lease/a")
+	ticketID, ok := p.Acquire("lease/a")
 	if !ok {
-		t.Fatalf("expected to acquire a slot")
+		t.Fatalf("expected to acquire a ticket")
 	}
 
-	// Shrink to 1: the leased slot must survive; only the available one may go.
+	// Shrink to 1: the leased ticket must survive; only the available one may go.
 	p.Resize(1)
 
-	total, available, leased, _ := p.Counts()
+	total, available, leased := p.Counts()
 	if total != 1 || leased != 1 || available != 0 {
-		t.Fatalf("shrink removed the wrong slot: total=%d available=%d leased=%d", total, available, leased)
+		t.Fatalf("shrink removed the wrong ticket: total=%d available=%d leased=%d", total, available, leased)
 	}
 
-	p.Release(slotID, "lease/a")
+	p.Release(ticketID, "lease/a")
 }
 
 func TestAcquireAndRelease(t *testing.T) {
-	p := newTestPool(t, 1)
+	p := newTestPool(t)
 	p.Resize(1)
-	time.Sleep(10 * time.Millisecond)
 
-	slotID, ok := p.Acquire("lease/a")
-	if !ok || slotID == "" {
-		t.Fatalf("expected to acquire the single available slot")
+	ticketID, ok := p.Acquire("lease/a")
+	if !ok || ticketID == "" {
+		t.Fatalf("expected to acquire the single available ticket")
 	}
 
 	if _, ok := p.Acquire("lease/b"); ok {
-		t.Fatalf("expected no slot to be available for a second acquirer")
+		t.Fatalf("expected no ticket to be available for a second acquirer")
 	}
 
-	p.Release(slotID, "lease/a")
+	p.Release(ticketID, "lease/a")
 
-	total, available, leased, _ := p.Counts()
+	total, available, leased := p.Counts()
 	if available != 1 || leased != 0 || total != 1 {
-		t.Fatalf("expected the slot back in the available pool, got available=%d leased=%d total=%d", available, leased, total)
+		t.Fatalf("expected the ticket back in the available budget, got available=%d leased=%d total=%d", available, leased, total)
 	}
 }
 
-func TestAcquireWhenNoneInitialized(t *testing.T) {
-	p := newTestPool(t, 10_000)
+func TestAcquireWhenPoolEmpty(t *testing.T) {
+	p := newTestPool(t)
 	if _, ok := p.Acquire("lease/a"); ok {
 		t.Fatalf("expected Acquire to fail against an empty pool")
 	}
 }
 
 func TestReleaseWithWrongKeyIsNoop(t *testing.T) {
-	p := newTestPool(t, 1)
+	p := newTestPool(t)
 	p.Resize(1)
-	time.Sleep(10 * time.Millisecond)
 
-	slotID, _ := p.Acquire("lease/a")
-	p.Release(slotID, "lease/someone-else")
+	ticketID, _ := p.Acquire("lease/a")
+	p.Release(ticketID, "lease/someone-else")
 
-	_, available, leased, _ := p.Counts()
+	_, available, leased := p.Counts()
 	if available != 0 || leased != 1 {
-		t.Fatalf("a release under the wrong key must not free the slot; got available=%d leased=%d", available, leased)
+		t.Fatalf("a release under the wrong key must not free the ticket; got available=%d leased=%d", available, leased)
 	}
 }
 
 func TestReleaseIsIdempotent(t *testing.T) {
-	p := newTestPool(t, 1)
+	p := newTestPool(t)
 	p.Resize(1)
-	time.Sleep(10 * time.Millisecond)
 
-	slotID, _ := p.Acquire("lease/a")
-	p.Release(slotID, "lease/a")
-	p.Release(slotID, "lease/a") // must not panic or double-count
+	ticketID, _ := p.Acquire("lease/a")
+	p.Release(ticketID, "lease/a")
+	p.Release(ticketID, "lease/a") // must not panic or double-count
 
-	_, available, leased, _ := p.Counts()
+	_, available, leased := p.Counts()
 	if available != 1 || leased != 0 {
-		t.Fatalf("expected one available slot after idempotent release, got available=%d leased=%d", available, leased)
+		t.Fatalf("expected one available ticket after idempotent release, got available=%d leased=%d", available, leased)
 	}
 }
 
 func TestTransferSucceedsUnderMatchingKey(t *testing.T) {
-	p := newTestPool(t, 1)
+	p := newTestPool(t)
 	p.Resize(1)
-	time.Sleep(10 * time.Millisecond)
 
-	slotID, _ := p.Acquire("podgate/ns/pod-1")
-	if !p.Transfer(slotID, "podgate/ns/pod-1", "lease/ns/pod-1-lease") {
+	ticketID, _ := p.Acquire("podgate/ns/pod-1")
+	if !p.Transfer(ticketID, "podgate/ns/pod-1", "lease/ns/pod-1-lease") {
 		t.Fatalf("expected transfer to succeed when the fromKey matches the current owner")
 	}
 
-	// The slot must now be released only under the NEW key.
-	p.Release(slotID, "podgate/ns/pod-1")
-	if _, available, leased, _ := p.Counts(); available != 0 || leased != 1 {
+	// The ticket must now be released only under the NEW key.
+	p.Release(ticketID, "podgate/ns/pod-1")
+	if _, available, leased := p.Counts(); available != 0 || leased != 1 {
 		t.Fatalf("release under the old (pre-transfer) key must be a no-op; got available=%d leased=%d", available, leased)
 	}
-	p.Release(slotID, "lease/ns/pod-1-lease")
-	if _, available, leased, _ := p.Counts(); available != 1 || leased != 0 {
-		t.Fatalf("release under the new (post-transfer) key must free the slot; got available=%d leased=%d", available, leased)
+	p.Release(ticketID, "lease/ns/pod-1-lease")
+	if _, available, leased := p.Counts(); available != 1 || leased != 0 {
+		t.Fatalf("release under the new (post-transfer) key must free the ticket; got available=%d leased=%d", available, leased)
 	}
 }
 
 func TestTransferFailsUnderWrongKey(t *testing.T) {
-	p := newTestPool(t, 1)
+	p := newTestPool(t)
 	p.Resize(1)
-	time.Sleep(10 * time.Millisecond)
 
-	slotID, _ := p.Acquire("podgate/ns/pod-1")
-	if p.Transfer(slotID, "not-the-owner", "lease/ns/pod-1-lease") {
+	ticketID, _ := p.Acquire("podgate/ns/pod-1")
+	if p.Transfer(ticketID, "not-the-owner", "lease/ns/pod-1-lease") {
 		t.Fatalf("transfer must fail when fromKey does not match the current owner")
 	}
 	// Ownership must be unchanged: the original key can still release it.
-	p.Release(slotID, "podgate/ns/pod-1")
-	if _, available, _, _ := p.Counts(); available != 1 {
-		t.Fatalf("expected the original owner to still be able to release the slot")
+	p.Release(ticketID, "podgate/ns/pod-1")
+	if _, available, _ := p.Counts(); available != 1 {
+		t.Fatalf("expected the original owner to still be able to release the ticket")
 	}
 }
 
-func TestTransferFailsOnUnknownSlot(t *testing.T) {
-	p := newTestPool(t, 1)
-	if p.Transfer("no-such-slot", "a", "b") {
-		t.Fatalf("transfer of a nonexistent slot must fail")
+func TestTransferFailsOnUnknownTicket(t *testing.T) {
+	p := newTestPool(t)
+	if p.Transfer("no-such-ticket", "a", "b") {
+		t.Fatalf("transfer of a nonexistent ticket must fail")
 	}
 }
 
 func TestManagerEnsurePoolIsIdempotentPerKey(t *testing.T) {
 	m := NewManager()
-	p1 := m.EnsurePool("ns/pool", "model", 100, 10)
+	p1 := m.EnsurePool("ns/pool", "model")
 	p1.Resize(2)
-	p2 := m.EnsurePool("ns/pool", "model", 999, 999) // different params, same key
+	p2 := m.EnsurePool("ns/pool", "a different model string")
 	if p1 != p2 {
 		t.Fatalf("EnsurePool must return the same *Pool for the same key")
 	}
-	total, _, _, _ := p2.Counts()
+	total, _, _ := p2.Counts()
 	if total != 2 {
-		t.Fatalf("expected the existing pool's slots to be preserved, got total=%d", total)
+		t.Fatalf("expected the existing pool's tickets to be preserved, got total=%d", total)
 	}
 }
 
@@ -201,7 +171,7 @@ func TestManagerGetPoolMissingReturnsNil(t *testing.T) {
 
 func TestManagerDeletePool(t *testing.T) {
 	m := NewManager()
-	m.EnsurePool("ns/pool", "model", 100, 10)
+	m.EnsurePool("ns/pool", "model")
 	m.DeletePool("ns/pool")
 	if p := m.GetPool("ns/pool"); p != nil {
 		t.Fatalf("expected the pool to be gone after DeletePool")
@@ -209,20 +179,19 @@ func TestManagerDeletePool(t *testing.T) {
 }
 
 // TestConcurrentAcquireReleaseNeverDoubleBooks hammers a small pool with many
-// concurrent goroutines acquiring and releasing slots, and fails the test if
-// any two "concurrently held" views ever claim the same slot ID at once.
-// Run with -race to also catch any unsynchronized access.
+// concurrent goroutines acquiring and releasing tickets, and fails the test
+// if any two "concurrently held" views ever claim the same ticket ID at
+// once. Run with -race to also catch any unsynchronized access.
 func TestConcurrentAcquireReleaseNeverDoubleBooks(t *testing.T) {
 	const poolSize = 5
 	const workers = 50
 	const iterationsPerWorker = 200
 
-	p := newTestPool(t, 1)
+	p := newTestPool(t)
 	p.Resize(poolSize)
-	time.Sleep(10 * time.Millisecond) // let all slots become available
 
 	var heldMu sync.Mutex
-	held := make(map[string]string) // slotID -> holder key, while "checked out" in this test
+	held := make(map[string]string) // ticketID -> holder key, while "checked out" in this test
 
 	var wg sync.WaitGroup
 	errs := make(chan error, workers*iterationsPerWorker)
@@ -233,28 +202,25 @@ func TestConcurrentAcquireReleaseNeverDoubleBooks(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < iterationsPerWorker; i++ {
 				key := fmt.Sprintf("lease/w%d/i%d", worker, i)
-				slotID, ok := p.Acquire(key)
+				ticketID, ok := p.Acquire(key)
 				if !ok {
 					continue // pool momentarily exhausted; not an error
 				}
 
 				heldMu.Lock()
-				if owner, already := held[slotID]; already {
+				if owner, already := held[ticketID]; already {
 					heldMu.Unlock()
-					errs <- fmt.Errorf("slot %s double-booked: held by %q and now acquired by %q", slotID, owner, key)
+					errs <- fmt.Errorf("ticket %s double-booked: held by %q and now acquired by %q", ticketID, owner, key)
 					continue
 				}
-				held[slotID] = key
+				held[ticketID] = key
 				heldMu.Unlock()
-
-				// Simulate doing a little work while holding the slot.
-				time.Sleep(time.Microsecond)
 
 				heldMu.Lock()
-				delete(held, slotID)
+				delete(held, ticketID)
 				heldMu.Unlock()
 
-				p.Release(slotID, key)
+				p.Release(ticketID, key)
 			}
 		}(w)
 	}
@@ -266,24 +232,24 @@ func TestConcurrentAcquireReleaseNeverDoubleBooks(t *testing.T) {
 		t.Error(err)
 	}
 
-	// Every slot must have made it back to Available; none leaked as Leased
+	// Every ticket must have made it back to Available; none leaked as Leased
 	// or vanished.
-	total, available, leased, _ := p.Counts()
+	total, available, leased := p.Counts()
 	if total != poolSize || leased != 0 || available != poolSize {
 		t.Fatalf("pool not clean after concurrent load: total=%d available=%d leased=%d (want %d/%d/0)", total, available, leased, poolSize, poolSize)
 	}
 }
 
 // TestConcurrentTransferIsExclusive checks that when many goroutines race to
-// Transfer the same slot away from a single owner key, exactly one succeeds.
+// Transfer the same ticket away from a single owner key, exactly one
+// succeeds.
 func TestConcurrentTransferIsExclusive(t *testing.T) {
-	p := newTestPool(t, 1)
+	p := newTestPool(t)
 	p.Resize(1)
-	time.Sleep(10 * time.Millisecond)
 
-	slotID, ok := p.Acquire("owner")
+	ticketID, ok := p.Acquire("owner")
 	if !ok {
-		t.Fatalf("setup: expected to acquire the slot")
+		t.Fatalf("setup: expected to acquire the ticket")
 	}
 
 	const contenders = 50
@@ -294,7 +260,7 @@ func TestConcurrentTransferIsExclusive(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			if p.Transfer(slotID, "owner", fmt.Sprintf("new-owner-%d", i)) {
+			if p.Transfer(ticketID, "owner", fmt.Sprintf("new-owner-%d", i)) {
 				mu.Lock()
 				successCount++
 				mu.Unlock()

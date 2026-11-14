@@ -77,9 +77,15 @@ spec:
               apiSocket:
                 description: |-
                   APISocket is the filesystem path to the target cloud-hypervisor
-                  instance's unix api-socket (e.g. /run/vc/vm/<id>/clh-api.sock, the
-                  same socket Substrate's own internal/ch package drives for
-                  pause/snapshot/resume).
+                  instance's unix api-socket: /run/vc/vm/<actor-uid>/clh-api.sock,
+                  confirmed against agent-substrate's cmd/ateworker-microvm/internal/kata
+                  (the same path Substrate's own worker drives for pause/snapshot/
+                  resume). Keyed by actor UID, not by worker pod -- a worker pod reuses
+                  one VM lifecycle per actor it ever hosts, so this path changes every
+                  time a different actor resumes onto the same pod. Left empty until
+                  cmd/substrate-gpu-bridge resolves the currently-assigned actor's UID;
+                  it is written together with DesiredState (never DesiredState=Attached
+                  with a stale or empty socket from a previous actor).
                 type: string
               desiredState:
                 description: |-
@@ -100,21 +106,21 @@ spec:
                 type: string
               deviceRef:
                 description: |-
-                  DeviceRef pins this attachment to one specific device ID from the
-                  pool (e.g. because an orchestrator upstream already chose it for
-                  hardware-compatibility reasons -- see "GPU checkpoint usually
+                  DeviceRef, if set, pins this attachment to one specific device ID
+                  within PoolRef (e.g. because an orchestrator upstream already chose
+                  it for hardware-compatibility reasons -- see "GPU checkpoint usually
                   restores only onto the same GPU model" in RUNBOOK.md/README.md's
-                  discussion of Substrate's own stated constraints). Mutually
-                  exclusive with PoolRef.
+                  discussion of Substrate's own stated constraints). Leave empty to let
+                  the reconciler acquire any Available device in the pool.
                 type: string
               poolRef:
                 description: |-
                   PoolRef is the name of the VFIOGPUPool (same namespace) to acquire a
-                  device from. Mutually exclusive with DeviceRef.
+                  device from.
                 type: string
             required:
-            - apiSocket
             - desiredState
+            - poolRef
             type: object
           status:
             description: |-

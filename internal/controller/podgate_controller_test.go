@@ -5,10 +5,13 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
+	gnwesv1alpha1 "gnwes/api/v1alpha1"
 	"gnwes/internal/pool"
 )
 
@@ -19,6 +22,27 @@ func gatedPod(name, namespace, poolRef string) *corev1.Pod {
 		pod.Labels = map[string]string{labelPoolRef: poolRef}
 	}
 	return pod
+}
+
+func sharedPool(name, namespace string, size int32) *gnwesv1alpha1.GPUWorkerPool {
+	return &gnwesv1alpha1.GPUWorkerPool{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec:       gnwesv1alpha1.GPUWorkerPoolSpec{PoolSize: size},
+	}
+}
+
+// newReadyPool creates a real GPUWorkerPool(Backend=Shared) CR in c AND its
+// matching in-memory admission pool in mgr, already resized — the shape
+// most GPULease/PodGate tests need as setup.
+func newReadyPool(t *testing.T, c client.Client, mgr *pool.Manager, namespace, name string, size int32) *pool.Pool {
+	t.Helper()
+	wp := sharedPool(name, namespace, size)
+	if err := c.Create(context.Background(), wp); err != nil {
+		t.Fatalf("setup: creating GPUWorkerPool: %v", err)
+	}
+	p := mgr.EnsurePool(namespace+"/"+name, "mock-model")
+	p.Resize(size)
+	return p
 }
 
 func TestPodGateReconcile_UngatedPodIsNoop(t *testing.T) {
@@ -77,11 +101,15 @@ func TestPodGateReconcile_WaitsWhenPoolDoesNotExistYet(t *testing.T) {
 }
 
 func TestPodGateReconcile_WaitsWhenNoCapacity(t *testing.T) {
-	mgr := pool.NewManager()
-	mgr.EnsurePool("ns/pool-a", "model", 100_000, 1).Resize(1) // never promotes within the test
-
 	pod := gatedPod("actor-1", "ns", "pool-a")
 	c := newFakeClient(t, pod)
+	mgr := pool.NewManager()
+	wp := sharedPool("pool-a", "ns", 1)
+	if err := c.Create(context.Background(), wp); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	mgr.EnsurePool("ns/pool-a", "model") // zero tickets: never any capacity
+
 	r := &PodGateReconciler{Client: c, Manager: mgr}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "actor-1", Namespace: "ns"}}
 
@@ -90,22 +118,22 @@ func TestPodGateReconcile_WaitsWhenNoCapacity(t *testing.T) {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if res.RequeueAfter == 0 {
-		t.Fatalf("expected a requeue while no slot is available")
+		t.Fatalf("expected a requeue while no ticket is available")
 	}
 
 	var got corev1.Pod
 	_ = c.Get(context.Background(), req.NamespacedName, &got)
 	if !hasGate(&got) {
-		t.Fatalf("the gate must stay while there is no available slot")
+		t.Fatalf("the gate must stay while there is no available ticket")
 	}
 }
 
 func TestPodGateReconcile_AdmitsAndReservesWhenCapacityExists(t *testing.T) {
-	mgr := pool.NewManager()
-	p := newReadyPool(mgr, "ns/pool-a", 1)
-
 	pod := gatedPod("actor-1", "ns", "pool-a")
 	c := newFakeClient(t, pod)
+	mgr := pool.NewManager()
+	p := newReadyPool(t, c, mgr, "ns", "pool-a", 1)
+
 	r := &PodGateReconciler{Client: c, Manager: mgr}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "actor-1", Namespace: "ns"}}
 
@@ -116,7 +144,7 @@ func TestPodGateReconcile_AdmitsAndReservesWhenCapacityExists(t *testing.T) {
 	var got corev1.Pod
 	_ = c.Get(context.Background(), req.NamespacedName, &got)
 	if hasGate(&got) {
-		t.Fatalf("expected the gate to be removed once a slot was reserved")
+		t.Fatalf("expected the gate to be removed once a ticket was reserved")
 	}
 	if got.Annotations[annoReservedSlot] == "" {
 		t.Fatalf("expected a reserved-slot annotation to be recorded")
@@ -124,17 +152,17 @@ func TestPodGateReconcile_AdmitsAndReservesWhenCapacityExists(t *testing.T) {
 	if !controllerutil.ContainsFinalizer(&got, gateFinalizer) {
 		t.Fatalf("expected the cleanup finalizer to be added")
 	}
-	if _, available, leased, _ := p.Counts(); available != 0 || leased != 1 {
-		t.Fatalf("expected the slot to show reserved/leased, got available=%d leased=%d", available, leased)
+	if _, available, leased := p.Counts(); available != 0 || leased != 1 {
+		t.Fatalf("expected the ticket to show reserved/leased, got available=%d leased=%d", available, leased)
 	}
 }
 
 func TestPodGateReconcile_DeleteReleasesUnclaimedReservation(t *testing.T) {
-	mgr := pool.NewManager()
-	p := newReadyPool(mgr, "ns/pool-a", 1)
-
 	pod := gatedPod("actor-1", "ns", "pool-a")
 	c := newFakeClient(t, pod)
+	mgr := pool.NewManager()
+	p := newReadyPool(t, c, mgr, "ns", "pool-a", 1)
+
 	r := &PodGateReconciler{Client: c, Manager: mgr}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "actor-1", Namespace: "ns"}}
 
@@ -153,17 +181,17 @@ func TestPodGateReconcile_DeleteReleasesUnclaimedReservation(t *testing.T) {
 		t.Fatalf("reconcile (cleanup): %v", err)
 	}
 
-	if _, available, leased, _ := p.Counts(); available != 1 || leased != 0 {
+	if _, available, leased := p.Counts(); available != 1 || leased != 0 {
 		t.Fatalf("expected the never-claimed reservation released back to Available, got available=%d leased=%d", available, leased)
 	}
 }
 
 func TestPodGateReconcile_DeleteAfterTransferDoesNotDoubleRelease(t *testing.T) {
-	mgr := pool.NewManager()
-	p := newReadyPool(mgr, "ns/pool-a", 1)
-
 	pod := gatedPod("actor-1", "ns", "pool-a")
 	c := newFakeClient(t, pod)
+	mgr := pool.NewManager()
+	p := newReadyPool(t, c, mgr, "ns", "pool-a", 1)
+
 	r := &PodGateReconciler{Client: c, Manager: mgr}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "actor-1", Namespace: "ns"}}
 
@@ -187,9 +215,9 @@ func TestPodGateReconcile_DeleteAfterTransferDoesNotDoubleRelease(t *testing.T) 
 		t.Fatalf("reconcile (cleanup after transfer): %v", err)
 	}
 
-	// The slot must still be owned by the lease's key, not have been
+	// The ticket must still be owned by the lease's key, not have been
 	// incorrectly released back to Available by the pod's own cleanup.
-	if _, available, leased, _ := p.Counts(); available != 0 || leased != 1 {
-		t.Fatalf("expected the slot to remain leased under the lease's ownership, got available=%d leased=%d", available, leased)
+	if _, available, leased := p.Counts(); available != 0 || leased != 1 {
+		t.Fatalf("expected the ticket to remain leased under the lease's ownership, got available=%d leased=%d", available, leased)
 	}
 }
