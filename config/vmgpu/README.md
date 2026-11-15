@@ -337,27 +337,73 @@ behind it is unit-tested (see `internal/substratebridge/kubectlate_test.go`).
       NVIDIA-related output, which is what first exposed that the
       original fix (built around `systemd-modules-load.service`) never
       actually ran.
-    - **The fix**: the same init-wrapper technique NVIDIA's own NVRC
-      project uses for exactly this situation. On the mounted rootfs:
+    - **First fix attempt, confirmed NOT sufficient on its own**: the
+      same init-wrapper technique NVIDIA's own NVRC project uses --
       rename the real init binary aside
-      (`/usr/bin/kata-agent -> /usr/bin/kata-agent.real`) and install a
+      (`/usr/bin/kata-agent -> /usr/bin/kata-agent.real`), install a
       tiny shell script at the exact path the kernel execs as init
-      (`/usr/bin/kata-agent`) that `modprobe`s the four NVIDIA modules
-      and then `exec`s the real binary:
+      that `modprobe`s the four NVIDIA modules once at boot, then
+      `exec`s the real binary. Tested live: the wrapper itself ran
+      correctly (`nvidia: loading out-of-tree module taints kernel.` at
+      `[0.302862]` proves it), but every module load failed with
+      `NVRM: No NVIDIA GPU found.` and unloaded. **Root cause**: the
+      GPU is hot-attached (cloud-hypervisor `vm.add-device`, driven by
+      the bridge sidecar's own poll loop) several seconds *after* boot
+      -- it is not yet on the PCI bus when this wrapper runs at
+      `[~0.2s]`. Confirmed in the same console log: the real PCI
+      hotplug enumeration (`pci 0000:00:07.0: [10de:1e02] ...`) doesn't
+      appear until `[4.890652]`. `nvidia.ko`'s own init scans for a
+      device once and unloads itself if none is present -- it does not
+      stay resident waiting for one. This rootfs also has no
+      udev/systemd running to react to the later PCI hotplug uevent
+      and auto-load the matching driver the normal way (`kata-agent`
+      itself does see that uevent in its own log, but only for its own
+      container-device-injection bookkeeping, never for driver
+      binding).
+    - **The real fix**: poll for the device appearing instead of a
+      one-shot modprobe at boot:
       ```sh
       #!/bin/sh
-      for m in nvidia nvidia-uvm nvidia-modeset nvidia-drm; do
-        /usr/sbin/modprobe "$m" 2>/dev/null
-      done
+      (
+        i=0
+        while [ "$i" -lt 150 ]; do
+          if grep -qs '^0x10de$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then
+            for m in nvidia nvidia-uvm nvidia-modeset nvidia-drm; do
+              /usr/sbin/modprobe "$m" 2>/dev/null
+            done
+            break
+          fi
+          i=$((i + 1))
+          sleep 0.2
+        done
+      ) &
       exec /usr/bin/kata-agent.real "$@"
       ```
-      `exec` replaces the process image in place, so PID 1 is preserved
-      across the handoff. This step is captured in
-      `build-nvidia-kata-image.sh`'s `install_init_wrapper` step so a
-      fresh build includes it from the start, not as a manual
-      post-build patch. New rootfs sha256 after adding the wrapper:
-      `39830d309a72981c4f3d1868dfa8b5c6b89e46f6fb906b95fecb1b398ee17254`
-      (kernel is unchanged).
+      Run as a backgrounded subshell before the `exec` -- `exec` only
+      replaces the PID 1 process image in place; an already-forked
+      background child is unaffected and keeps polling independently.
+      **Confirmed live, real success**: with this fix, the same
+      console log shows the GPU hotplug at `[3.828938]`, then at
+      `[4.053426]` `nvidia: loading out-of-tree module taints kernel.`
+      followed by `nvidia 0000:00:07.0: vgaarb: VGA decodes changed...`
+      (binding to the real device this time, not "No NVIDIA GPU
+      found"), `NVRM: loading NVIDIA UNIX Open Kernel Module for
+      x86_64  580.178.04  Release Build`, and `nvidia-modeset: Loading
+      NVIDIA UNIX Open Kernel Mode Setting Driver`. `kata-agent`'s own
+      uevent log independently confirms all four modules bound:
+      `/module/nvidia`, `/module/nvidia_uvm`, `/module/nvidia_modeset`,
+      `/module/nvidia_drm`. This is the first real, conclusive
+      confirmation in this project that `nvidia.ko` actually binds
+      inside the guest against a live hot-attached GPU, not just that
+      hot-attach itself succeeds at the PCI level.
+      Both wrapper versions are captured in
+      `build-nvidia-kata-image.sh`'s `install_init_wrapper` step (the
+      polling version is what ships; the one-shot version's failure is
+      kept in a comment as the reason why). Final rootfs sha256:
+      `e907f66c9e03e8e26b71f20953af1f72b8d325108279ae810643966acdd7949c`
+      (kernel is unchanged; an intermediate one-shot-wrapper build,
+      `39830d309a72981c4f3d1868dfa8b5c6b89e46f6fb906b95fecb1b398ee17254`,
+      was uploaded and tested but superseded by this one).
     - **A real mistake made and fixed while building this, left in
       because it's a genuine footgun**: the kernel build's own
       `lib/modules/<release>/` output directory contains a `build`
@@ -378,9 +424,9 @@ behind it is unit-tested (see `internal/substratebridge/kubectlate_test.go`).
       (updated after the init-wrapper fix below; the original
       pre-wrapper upload was `78f5f498927489659ec7e6b22242f2be3d8b45ce148ebccf772838e6f649080c`).
     - **Tested live, same day — real hot-attach confirmed working end to
-      end against the custom image; `nvidia.ko` binding itself is NOT
-      conclusively confirmed, and that's an honest gap, not an
-      oversight.** Pointed `gnwes-counter-exclusive`'s
+      end against the custom image, and `nvidia.ko` binding itself
+      eventually confirmed too, after two more rounds of real
+      debugging (see below).** Pointed `gnwes-counter-exclusive`'s
       `sandboxClasses[0].configRef` at the new `SandboxConfig`, deleted
       its pod to force a real (not reused) recreation, resumed the
       actor. Two more real, previously-latent bugs surfaced and got
@@ -392,18 +438,18 @@ behind it is unit-tested (see `internal/substratebridge/kubectlate_test.go`).
       directly confirms this VM was staged with our exact custom
       `kata-kernel`/`kata-image` sha256 values, not the stock ones — the
       custom build genuinely was used, not silently bypassed.
-      What's NOT confirmed: whether `nvidia.ko` actually bound inside the
-      guest. The console log turned out to be `kata-agent`'s own
-      structured JSON log stream (every line carries `"source":"agent"`
-      — its own systemd unit sets `StandardOutput=tty` onto the shared
-      console), not a raw kernel/systemd boot log; it only starts once
-      `kata-agent.service` itself starts, well after
-      `systemd-modules-load.service` (where module loading happens)
-      would have run and printed anything. There is still no exec
-      access to the guest OS itself to check `lsmod` directly (only to
-      the demo app's own driver-less, shell-less container on top, the
-      same limitation as always) — so this specific question stays
-      open, honestly, rather than inferred from indirect evidence.
+      First pass, `nvidia.ko` binding was NOT conclusively confirmed:
+      the console log turned out to be `kata-agent`'s own structured
+      JSON log stream (every line carries `"source":"agent"`), which
+      only starts once `kata-agent.service` itself starts -- on a
+      systemd-based rootfs that's well after
+      `systemd-modules-load.service` would have run, so nothing about
+      module loading showed up either way. Forcing a genuine cold boot
+      (reading the full `[0.xxx]`-timestamped segment from power-on,
+      not a restored actor's log) is what actually surfaced the real
+      init-PID1 and hot-attach-timing findings below -- see those
+      entries for the full resolution, ending in a conclusively
+      confirmed `nvidia.ko` bind against a real hot-attached GPU.
     - **Two more real bugs found and fixed getting here, both
       previously-latent, never exercised until a worker pod was
       actually recreated from scratch with a *different* SandboxConfig

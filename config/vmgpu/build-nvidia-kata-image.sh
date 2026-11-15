@@ -137,15 +137,38 @@ echo "== 6b. install_init_wrapper: this rootfs's /usr/sbin/init -> systemd is ne
 # nvidia.ko never binds despite the hot-attach itself succeeding.
 # Same technique NVIDIA's own NVRC init uses: rename the real init
 # aside, install a tiny wrapper at the exact path the kernel execs as
-# init, modprobe the modules, then exec the real binary -- exec
-# replaces the process image in place, so PID 1 is preserved.
+# init, then exec the real binary -- exec replaces the process image
+# in place, so PID 1 is preserved.
+#
+# A naive `modprobe` at init time here is NOT enough and was confirmed
+# live to fail (2026-11-15): the GPU is hot-attached (cloud-hypervisor
+# `vm.add-device`, driven by the bridge sidecar's poll loop) several
+# seconds AFTER boot -- it is not present on the PCI bus yet when this
+# wrapper runs at [~0.2s]. `nvidia.ko`'s own init scans for a device
+# once, logs "NVRM: No NVIDIA GPU found.", and unloads itself if none
+# is present -- it does not stay resident waiting for one. This rootfs
+# also has no udev/systemd running to react to the later PCI hotplug
+# uevent (kata-agent itself does see that uevent in its own log, but
+# only for its own container-device-injection bookkeeping, never for
+# driver binding). So: poll for the device appearing instead of a
+# one-shot modprobe at boot.
 if [ ! -f /mnt/nvidia-rootfs/usr/bin/kata-agent.real ]; then
   sudo mv /mnt/nvidia-rootfs/usr/bin/kata-agent /mnt/nvidia-rootfs/usr/bin/kata-agent.real
   cat <<'WRAPPER' | sudo tee /mnt/nvidia-rootfs/usr/bin/kata-agent >/dev/null
 #!/bin/sh
-for m in nvidia nvidia-uvm nvidia-modeset nvidia-drm; do
-  /usr/sbin/modprobe "$m" 2>/dev/null
-done
+(
+  i=0
+  while [ "$i" -lt 150 ]; do
+    if grep -qs '^0x10de$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then
+      for m in nvidia nvidia-uvm nvidia-modeset nvidia-drm; do
+        /usr/sbin/modprobe "$m" 2>/dev/null
+      done
+      break
+    fi
+    i=$((i + 1))
+    sleep 0.2
+  done
+) &
 exec /usr/bin/kata-agent.real "$@"
 WRAPPER
   sudo chmod 755 /mnt/nvidia-rootfs/usr/bin/kata-agent

@@ -645,6 +645,54 @@ the real host-visible api-socket path. See "Is this real, or simulated?"
 below for exactly how far past that the real GPU hot-attach itself has
 been confirmed as of this writing.
 
+### 4.7 — check whether `nvidia.ko` actually bound inside the guest
+
+This requires the custom, driver-included Kata image
+(`config/vmgpu/README.md`'s "custom Kata GPU image" entry,
+`sandboxClasses[0].configRef: {name: microvm-nvidia-gpu}`) -- the stock
+image has no NVIDIA driver at all. There is no exec access into the guest
+OS itself (only into the demo app's own driver-less, shell-less
+container on top of it), so this is checked from the host via the VM's
+console log, which captures real kernel `printk` output alongside
+`kata-agent`'s own structured JSON log on the same shared console device.
+
+```bash
+# on the GPU node (dcn-gpu-0):
+ACTOR_UID=$(sudo find /var/lib/ate/actors -maxdepth 1 -mindepth 1 -printf '%T@ %f\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}')
+echo "most recently touched actor: $ACTOR_UID"
+sudo cat /var/lib/ate/actors/$ACTOR_UID/sandbox-assets.json   # confirm the custom kata-image sha256 is in use
+sudo cat /var/lib/ate/actors/$ACTOR_UID/snapshot-state.json 2>/dev/null || echo "(no snapshot-state.json -- this is a cold boot, needed to see early-boot console output)"
+
+CONSOLE=$(sudo find /var/lib/gnwes/vcvm -maxdepth 3 -iname 'console.log' 2>/dev/null | grep -i "$ACTOR_UID")
+echo "console log: $CONSOLE"
+sudo grep -n -i 'nvidia\|nvlink\|NVRM\|pci 0000:00:07' "$CONSOLE"
+```
+
+**Expect, in this order** (only on a true cold boot -- a restored actor's
+console log starts too late to show any of this):
+1. `Run /usr/bin/kata-agent as init process` -- confirms this cluster's
+   real boot path (kernel execs `kata-agent` directly, bypassing
+   systemd; see `config/vmgpu/README.md`'s "init-PID1" entry).
+2. `pci 0000:00:07.0: [10de:1e02] ...` -- the real GPU hot-attach at the
+   PCI level, several seconds into boot (this is `vm.add-device`, not
+   something that happens at kernel boot time).
+3. Shortly after that: `nvidia: loading out-of-tree module taints
+   kernel.`, then `nvidia 0000:00:07.0: vgaarb: VGA decodes changed...`
+   (binding to the real device -- **not** `NVRM: No NVIDIA GPU found.`,
+   which means the modprobe ran too early, before step 2), then `NVRM:
+   loading NVIDIA UNIX Open Kernel Module for x86_64  <version>` and
+   `nvidia-modeset: Loading NVIDIA UNIX Open Kernel Mode Setting
+   Driver`. `kata-agent`'s own uevent log independently confirms it:
+   `"event":"Uevent { action: \"add\", devpath: \"/module/nvidia\", ...`
+   (and `/module/nvidia_uvm`, `/module/nvidia_modeset`,
+   `/module/nvidia_drm`).
+
+If you only see `NVRM: No NVIDIA GPU found.` with no later success lines,
+the rootfs is running the older one-shot-modprobe-at-boot wrapper, not
+the polling one -- see `config/vmgpu/README.md`'s "real fix" entry under
+the init-wrapper discussion and `build-nvidia-kata-image.sh`'s
+`install_init_wrapper` step.
+
 ## Phase 5 — Shared tier real Volcano vGPU slicing, run for real 2026-11-15
 
 This exercises real fractional GPU *sharing* on the Shared tier — several
