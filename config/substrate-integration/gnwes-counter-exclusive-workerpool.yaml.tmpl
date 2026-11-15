@@ -59,9 +59,10 @@ spec:
     # creation, same "admission/creation-time only" limitation
     # podgate-webhook's own mutations have) -- confirmed the hard way
     # (2026-11-15): delete the pod, don't just patch the WorkerPool, to
-    # actually pick this up.
-    # configRef:
-    #   name: microvm-nvidia-gpu
+    # actually pick this up. Live on this cluster as of 2026-11-15
+    # (applied via `kubectl patch`, now reflected here too).
+    configRef:
+      name: microvm-nvidia-gpu
   template:
     labels:
       gnwes.io/gpu-pool: gnwes-counter-exclusive-pool

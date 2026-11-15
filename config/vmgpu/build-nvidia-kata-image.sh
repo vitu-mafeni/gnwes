@@ -121,6 +121,35 @@ sudo mkdir -p /mnt/nvidia-rootfs/etc/modules-load.d
 printf 'nvidia\nnvidia-uvm\nnvidia-modeset\nnvidia-drm\n' | sudo tee /mnt/nvidia-rootfs/etc/modules-load.d/nvidia.conf >/dev/null
 # nvidia-peermem deliberately omitted: GPUDirect RDMA only, not needed
 # for a single-GPU actor and not auto-loaded by default upstream either.
+# /etc/modules-load.d/nvidia.conf above is only honored by
+# systemd-modules-load.service -- harmless to leave in place, but
+# INERT on this cluster (see install_init_wrapper below), so don't
+# rely on it alone.
+
+echo "== 6b. install_init_wrapper: this rootfs's /usr/sbin/init -> systemd is never actually run here =="
+# Confirmed via a genuine cold-boot console log (2026-11-15): this
+# cluster's kernel is booted with init=/usr/bin/kata-agent directly
+# ("[ 0.205443] check access for rdinit=/init failed: -2, ignoring"
+# immediately followed by "[ 0.208384] Run /usr/bin/kata-agent as init
+# process"), bypassing systemd -- and therefore
+# systemd-modules-load.service -- entirely. Without this step the
+# modules above are present in the image but never loaded, and
+# nvidia.ko never binds despite the hot-attach itself succeeding.
+# Same technique NVIDIA's own NVRC init uses: rename the real init
+# aside, install a tiny wrapper at the exact path the kernel execs as
+# init, modprobe the modules, then exec the real binary -- exec
+# replaces the process image in place, so PID 1 is preserved.
+if [ ! -f /mnt/nvidia-rootfs/usr/bin/kata-agent.real ]; then
+  sudo mv /mnt/nvidia-rootfs/usr/bin/kata-agent /mnt/nvidia-rootfs/usr/bin/kata-agent.real
+  cat <<'WRAPPER' | sudo tee /mnt/nvidia-rootfs/usr/bin/kata-agent >/dev/null
+#!/bin/sh
+for m in nvidia nvidia-uvm nvidia-modeset nvidia-drm; do
+  /usr/sbin/modprobe "$m" 2>/dev/null
+done
+exec /usr/bin/kata-agent.real "$@"
+WRAPPER
+  sudo chmod 755 /mnt/nvidia-rootfs/usr/bin/kata-agent
+fi
 
 df -h /mnt/nvidia-rootfs   # confirm there's still free space -- this project's
                             # stock image ships ~50MB of headroom; our additions

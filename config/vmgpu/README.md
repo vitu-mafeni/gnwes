@@ -317,13 +317,47 @@ behind it is unit-tested (see `internal/substratebridge/kubectlate_test.go`).
       worth being deliberate about; the 4 real `.ko` files this build
       produced (`nvidia`, `nvidia-uvm`, `nvidia-modeset`, `nvidia-drm` —
       `nvidia-peermem` is GPUDirect-RDMA-only, skipped); and one
-      `/etc/modules-load.d/nvidia.conf`. This rootfs turned out to be
-      **systemd-based**, not `kata-agent`-as-init (confirmed via
-      `/usr/sbin/init -> systemd`) — systemd's own built-in
-      `systemd-modules-load.service` (confirmed present and enabled,
-      `Before=sysinit.target`) loads the modules automatically before
-      `kata-agent.service` starts, needing zero init-wrapper or unit-file
-      changes at all.
+      `/etc/modules-load.d/nvidia.conf`.
+    - **Real finding that corrects an earlier wrong assumption made
+      while building this same rootfs**: it does have
+      `/usr/sbin/init -> systemd` and a real, enabled
+      `systemd-modules-load.service`, but **this real deployment's
+      kernel never runs systemd at all.** Its boot parameters set
+      `init=/usr/bin/kata-agent` directly, and the console log proves
+      it: `[ 0.205443] check access for rdinit=/init failed: -2,
+      ignoring` immediately followed by `[ 0.208384] Run
+      /usr/bin/kata-agent as init process` — the kernel execs
+      `kata-agent` as PID 1 itself, so `systemd-modules-load.service`
+      (and every other systemd unit) never starts, never mind runs.
+      `/etc/modules-load.d/nvidia.conf` alone is therefore inert here.
+      This was only discovered by forcing a genuine cold boot (a
+      brand-new actor, not a restored one — a restored actor's console
+      log starts too late, mid-boot, to show this) and reading the
+      full `[0.xxx]`-timestamped segment from power-on; it showed zero
+      NVIDIA-related output, which is what first exposed that the
+      original fix (built around `systemd-modules-load.service`) never
+      actually ran.
+    - **The fix**: the same init-wrapper technique NVIDIA's own NVRC
+      project uses for exactly this situation. On the mounted rootfs:
+      rename the real init binary aside
+      (`/usr/bin/kata-agent -> /usr/bin/kata-agent.real`) and install a
+      tiny shell script at the exact path the kernel execs as init
+      (`/usr/bin/kata-agent`) that `modprobe`s the four NVIDIA modules
+      and then `exec`s the real binary:
+      ```sh
+      #!/bin/sh
+      for m in nvidia nvidia-uvm nvidia-modeset nvidia-drm; do
+        /usr/sbin/modprobe "$m" 2>/dev/null
+      done
+      exec /usr/bin/kata-agent.real "$@"
+      ```
+      `exec` replaces the process image in place, so PID 1 is preserved
+      across the handoff. This step is captured in
+      `build-nvidia-kata-image.sh`'s `install_init_wrapper` step so a
+      fresh build includes it from the start, not as a manual
+      post-build patch. New rootfs sha256 after adding the wrapper:
+      `39830d309a72981c4f3d1868dfa8b5c6b89e46f6fb906b95fecb1b398ee17254`
+      (kernel is unchanged).
     - **A real mistake made and fixed while building this, left in
       because it's a genuine footgun**: the kernel build's own
       `lib/modules/<release>/` output directory contains a `build`
@@ -340,11 +374,124 @@ behind it is unit-tested (see `internal/substratebridge/kubectlate_test.go`).
       — the stock `microvm` config, and every other WorkerPool still
       using it, is completely untouched.
       Real sha256es: kernel `c3b5598732fc3b7ae79b55588e7a475134f7c422272add4bc91f8c1967f3559a`,
-      rootfs `78f5f498927489659ec7e6b22242f2be3d8b45ce148ebccf772838e6f649080c`.
-    - **Not yet done**: actually pointing a worker pool's `configRef` at
-      it, resuming an actor onto a freshly-created (not reused) pod, and
-      checking the console log for real `nvidia.ko` binding evidence —
-      the next real-hardware step.
+      rootfs `39830d309a72981c4f3d1868dfa8b5c6b89e46f6fb906b95fecb1b398ee17254`
+      (updated after the init-wrapper fix below; the original
+      pre-wrapper upload was `78f5f498927489659ec7e6b22242f2be3d8b45ce148ebccf772838e6f649080c`).
+    - **Tested live, same day — real hot-attach confirmed working end to
+      end against the custom image; `nvidia.ko` binding itself is NOT
+      conclusively confirmed, and that's an honest gap, not an
+      oversight.** Pointed `gnwes-counter-exclusive`'s
+      `sandboxClasses[0].configRef` at the new `SandboxConfig`, deleted
+      its pod to force a real (not reused) recreation, resumed the
+      actor. Two more real, previously-latent bugs surfaced and got
+      fixed along the way (see below); once fixed, the attachment
+      reached `PHASE: Attached`, `DEVICE: gpu-exclusive-0`,
+      `GUESTBDF: 0000:00:07.0`, `ATTACHMS: 485` — a real
+      `vm.add-device` success against the custom-kernel VM.
+      `/var/lib/ate/actors/<uid>/sandbox-assets.json` on the node
+      directly confirms this VM was staged with our exact custom
+      `kata-kernel`/`kata-image` sha256 values, not the stock ones — the
+      custom build genuinely was used, not silently bypassed.
+      What's NOT confirmed: whether `nvidia.ko` actually bound inside the
+      guest. The console log turned out to be `kata-agent`'s own
+      structured JSON log stream (every line carries `"source":"agent"`
+      — its own systemd unit sets `StandardOutput=tty` onto the shared
+      console), not a raw kernel/systemd boot log; it only starts once
+      `kata-agent.service` itself starts, well after
+      `systemd-modules-load.service` (where module loading happens)
+      would have run and printed anything. There is still no exec
+      access to the guest OS itself to check `lsmod` directly (only to
+      the demo app's own driver-less, shell-less container on top, the
+      same limitation as always) — so this specific question stays
+      open, honestly, rather than inferred from indirect evidence.
+    - **Two more real bugs found and fixed getting here, both
+      previously-latent, never exercised until a worker pod was
+      actually recreated from scratch with a *different* SandboxConfig
+      pointing at it:**
+      1. `cmd/substrate-gpu-bridge`'s `HostAPISocketPath` had hardcoded
+         `clh-api-restore.sock` as the one true socket name, based on
+         2026-11-13 testing that concluded Substrate "always restores" —
+         true only because every resume tested until then reused a
+         worker pod with its own existing local checkpoint. A pod
+         recreated from scratch can cold-`run` instead (`clh-api.sock`),
+         even for an actor with prior checkpoint history elsewhere —
+         `vm.add-device` then failed with "no such file or directory"
+         (dialing a socket that was never created) — see
+         `internal/substratebridge/bridge.go`'s own doc comment.
+      2. The real fix for #1 — checking which socket name actually
+         exists — belongs in `cmd/manager`
+         (`internal/controller/vmgpuattachment_controller.go`'s new
+         `resolveRealAPISocket`), **not** in the bridge sidecar: an
+         earlier attempt put the check inside `HostAPISocketPath`
+         itself, which runs inside the bridge's own container — one
+         that was deliberately given no hostPath mount into
+         `GNWESHostVCVMDir` at all (by original design, it only ever
+         needed to write a path *string*, never open the socket). That
+         check could only ever see ENOENT regardless of what actually
+         existed on the host, so the attachment stayed permanently
+         `Detached` — a real regression, caught before it shipped
+         anywhere but this live test.
+      Both are genuinely new findings this cluster's real hardware
+      surfaced, not something a stock Kata/Substrate install would hit
+      on its own — see `internal/substratebridge/bridge_test.go` and
+      `internal/controller/vmgpuattachment_controller_test.go` for the
+      regression tests.
+    - **A third, separate issue — first suspected to be a cold
+      informer-cache timing bug, then root-caused to something much
+      simpler and already-seen in this project**: after a worker pod
+      recreation, its new `VMGPUAttachment` was never created
+      automatically at all — not just slowly. Grepping the full
+      `manager.log` window confirmed zero automatic `gpuworkerpool`
+      reconciles ever followed a pod create/delete, on two separate
+      occasions hours apart (so "cold cache after restart" was ruled
+      out — the second occurrence had no restart in between). A
+      manual `kubectl annotate gpuworkerpool <name> nudge=... --overwrite`
+      always made it fire immediately, proving the reconcile logic
+      itself was correct once triggered — only the trigger was
+      missing.
+      **Real cause**: `dcn-gpu-0`'s own checkout of this repository is
+      a plain `scp`'d tree, not a git clone (`git log` there fails
+      with "not a git repository"), and its
+      `internal/controller/gpuworkerpool_controller.go` was dated
+      2026-11-12 — one day *before* the `mapPodToWorkerPool`/`Watches`
+      fix was committed upstream on 2026-11-13. `strings` on the
+      actual running `bin/manager` binary confirmed it directly: zero
+      matches for `mapPodToWorkerPool` or `EnqueueRequestsFromMapFunc`.
+      The manager's own startup log confirmed it a second way: only
+      one `Starting EventSource` line for the `gpuworkerpool`
+      controller (`*v1alpha1.GPUWorkerPool` itself), never a second one
+      for `*v1.Pod` — unlike the separate `podgate` controller, which
+      does watch Pods and logs its own `*v1.Pod` EventSource. The
+      Pod-watch feature this doc already described as "added
+      2026-11-13" was never actually running on real hardware at all.
+      **Same lesson as the `scripts/start-manager.sh` gap below, hit a
+      second time**: a commit landing in this git history is necessary
+      but not sufficient — it has to actually be `scp`'d to, and the
+      binary rebuilt on, every real machine that runs it. Fix applied:
+      re-sync the full source tree to both `server1` and `dcn-gpu-0`
+      and rebuild `cmd/manager` there (see `REPRODUCTION-GUIDE.md`'s
+      sync step); verify by checking for a second `Starting
+      EventSource` line for `*v1.Pod` under `"controller":
+      "gpuworkerpool"` in the fresh `manager.log`, and by recreating a
+      worker pod and confirming its `VMGPUAttachment` appears
+      automatically with no manual annotate.
+    - **Harbor registry push timeouts, hit again rebuilding
+      `substrate-gpu-bridge` three times for the fixes above**: the
+      same two-largest-layers timeout as 2026-11-13, same real fix
+      (`docker save` + `skopeo copy docker-archive:...`, see
+      `REPRODUCTION-GUIDE.md`'s Phase 4) — `skopeo copy
+      docker-daemon:...` looked like a shortcut but fails on an
+      unrelated Docker API version mismatch in its own vendored client
+      on this cluster, confirmed live; the archive step is required.
+    - **Operational note, confirmed the hard way**: `scripts/start-
+      manager.sh` existing in this git history does not mean it exists
+      on any real node — it had never actually been `scp`'d to either
+      `server1` or `dcn-gpu-0`, despite being referenced as already
+      "committed" earlier. Committing a file and *syncing* it to the
+      machines that actually run it are two different steps in this
+      project's workflow; this doc and `REPRODUCTION-GUIDE.md` are the
+      source of truth for what a fresh machine needs, not an assumption
+      that `git log` implies deployment.
   - Detach found and fixed two real bugs in
     `VMGPUAttachmentReconciler.reconcileDetach`: Agent Substrate's actor
     `suspend` fully tears down the microVM's whole working directory (not

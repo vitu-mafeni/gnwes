@@ -585,6 +585,36 @@ go build -o bin/manager ./cmd/manager
 KUBECONFIG=<that kubeconfig> ./bin/manager --health-probe-bind-address=:8082
 ```
 
+**Sync warning, confirmed the hard way (2026-11-15):** a checkout on the
+GPU node reached this way (typically `scp`, not a git clone -- `git log`
+there may well fail with "not a git repository") can silently drift behind
+the real repo. This bit us for real:
+`GPUWorkerPoolReconciler`'s Pod-watch fix (`mapPodToWorkerPool`, the thing
+that makes `VMGPUAttachment` creation in 4.6 above actually automatic) was
+committed upstream on 2026-11-13, but the GPU node's own copy of
+`internal/controller/gpuworkerpool_controller.go` stayed dated 2026-11-12
+-- one day older -- through at least one later `cmd/manager` rebuild that
+only happened to touch other files. The result looked exactly like a
+runtime bug (new pods sat with no `VMGPUAttachment` for minutes, sometimes
+indefinitely) but was actually just stale source. Confirm this is NOT
+happening to you before chasing a "the watch is slow" theory:
+
+```bash
+# on the GPU node:
+strings bin/manager | grep -c mapPodToWorkerPool   # expect >=1; 0 means the
+                                                     # binary predates the Pod-watch fix
+grep -n 'Starting EventSource' manager.log | grep gpuworkerpool
+# expect TWO lines: one "kind source: *v1alpha1.GPUWorkerPool", one
+# "kind source: *v1.Pod" -- only one means the Watch never registered
+```
+
+If either check fails, re-sync the full source tree to that node (not just
+the one file you think changed) and rebuild `bin/manager` there before
+concluding anything about runtime behavior. Committing a fix to git and
+having it actually running on the real machine are two different,
+independently-necessary steps in this project's workflow -- see also the
+`scripts/start-manager.sh` note in `config/vmgpu/README.md`.
+
 ### 4.6 — exercise it
 
 Once the pod reaches `Running` with the sidecar attached (`kubectl get pod

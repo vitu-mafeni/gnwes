@@ -16,12 +16,15 @@
 # VM creation -- incompatible with this project's whole point, live
 # hot-attach via cloud-hypervisor), and exactly how the custom kernel
 # (built with Kata's own `-g nvidia` kernel-builder flag) and rootfs
-# (stock image + kmod/libkmod + the 4 NVIDIA .ko modules + an
-# /etc/modules-load.d/nvidia.conf, so systemd's own built-in
-# systemd-modules-load.service loads them automatically before
-# kata-agent.service starts -- confirmed this rootfs is systemd-based,
-# not a kata-agent-as-init one, and that ordering needs zero unit-file
-# changes) were actually assembled.
+# (stock image + kmod/libkmod + the 4 NVIDIA .ko modules) were actually
+# assembled. NOTE: this rootfs has /usr/sbin/init -> systemd and a real
+# systemd-modules-load.service, but THIS CLUSTER'S KERNEL NEVER RUNS
+# SYSTEMD -- it execs kata-agent directly as PID 1 (init=/usr/bin/kata-agent),
+# confirmed via console log. Module loading is therefore done by an
+# init-wrapper at /usr/bin/kata-agent (modprobes the 4 modules, then
+# execs the real binary renamed to kata-agent.real) -- see
+# config/vmgpu/README.md's "init-PID1" entry and
+# build-nvidia-kata-image.sh's install_init_wrapper step.
 #
 # The cloud-hypervisor/virtiofsd asset entries below are copied
 # VERBATIM from this cluster's existing "microvm" SandboxConfig as of
@@ -56,5 +59,5 @@ spec:
           sha256: c3b5598732fc3b7ae79b55588e7a475134f7c422272add4bc91f8c1967f3559a
           url: s3://ate-snapshots/microvm-assets/amd64/c3b5598732fc3b7ae79b55588e7a475134f7c422272add4bc91f8c1967f3559a
         kata-image:
-          sha256: 78f5f498927489659ec7e6b22242f2be3d8b45ce148ebccf772838e6f649080c
-          url: s3://ate-snapshots/microvm-assets/amd64/78f5f498927489659ec7e6b22242f2be3d8b45ce148ebccf772838e6f649080c
+          sha256: 39830d309a72981c4f3d1868dfa8b5c6b89e46f6fb906b95fecb1b398ee17254
+          url: s3://ate-snapshots/microvm-assets/amd64/39830d309a72981c4f3d1868dfa8b5c6b89e46f6fb906b95fecb1b398ee17254
