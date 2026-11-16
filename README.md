@@ -162,9 +162,14 @@ close the other half — polling one actor's state (`kubectl-ate get actor -o
 json`, since Substrate's `Actor` isn't a Kubernetes CRD) and flipping
 `VMGPUAttachment.spec.desiredState` to match — also verified against a real
 Agent Substrate actor's real resume/suspend lifecycle, on the same real
-cluster. See `config/vmgpu/README.md` for exactly what's verified and what
-isn't, and `config/vmgpu/TESTING-WITH-REAL-AGENTS.md` for the staged plan
-to combine both proofs and extend this to real WorkerPools and notebooks.
+cluster. **On 2026-11-16, a real, non-ko-built container (`nvidia-smi`
+itself) actually used that hot-attached GPU** — not just enumerated it —
+from inside a real Substrate actor; see `config/vmgpu/BENCHMARKS.md` for
+the measured attach/detach latencies this now achieves on real hardware,
+reproducible with its own included script. See `config/vmgpu/README.md`
+for exactly what's verified and what isn't, and
+`config/vmgpu/TESTING-WITH-REAL-AGENTS.md` for the staged plan to combine
+both proofs and extend this to real WorkerPools and notebooks.
 
 ## Quickstart
 

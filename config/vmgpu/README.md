@@ -1032,6 +1032,12 @@ privilege. Neither requirement is new, but a reboot recovery that restarts
 `cmd/manager` without both can silently reproduce the exact
 `resolveRealAPISocket` failure mode its own doc comment already describes.
 
+**See `BENCHMARKS.md`** for measured real-hardware attach/detach latency
+(sub-second: ~468ms attach, ~124ms detach) and a transparently-labeled
+projection of what a pre-booted, idle microVM pool (not built, not
+measured) could plausibly save on top of that — reproducible with its
+own included `bench-gpu-attach.sh` script.
+
 ## Testing without real hardware
 
 `cmd/fakevmm` is a small stand-in VMM server (not part of the production
