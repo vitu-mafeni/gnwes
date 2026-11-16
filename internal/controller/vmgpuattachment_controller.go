@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -62,6 +63,64 @@ type VMGPUAttachmentReconciler struct {
 // +kubebuilder:rbac:groups=gnwes.io,resources=vmgpuattachments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gnwes.io,resources=vmgpuattachments/status,verbs=get;update;patch
 
+// updateStatusWithRetry re-GETs att and reapplies mutate's Status changes on
+// a write conflict, instead of returning "the object has been modified" up
+// to controller-runtime. Confirmed live (2026-11-16): every reconcileAttach
+// retry path pairs a non-nil error with an explicit RequeueAfter, and
+// controller-runtime's own doc comment on Reconciler -- borne out by its
+// "RequeueAfter and Requeue will always be ignored if the error is
+// non-nil" warning, logged on every one of these conflicts -- discards that
+// RequeueAfter whenever the error is non-nil, falling back to its default
+// backoff instead. A real-hardware VMGPUAttachment is exactly the kind of
+// object multiple reconciles (this controller's own explicit RequeueAfter
+// retries, cmd/substrate-gpu-bridge's spec patches, informer-cache replay
+// after a restart) touch around the same few seconds, so a plain
+// Status().Update() here conflicted on essentially every attempt once a
+// real actor's VM survived long enough to reach vm.add-device (the pmem
+// bug fixed in agent-substrate made that unreachable before 2026-11-16) --
+// att.Status never reached Attached, Failed, or any of this method's other
+// terminal states at all; it just sat on whatever reconcileAttach/
+// reconcileDetach's last clean write had been, forever. att itself is
+// updated in place with whatever this wrote, so a caller's log line right
+// after this call (e.g. reconcileAttach's own "vmgpuattachment attached")
+// reports what's actually now in etcd.
+func (r *VMGPUAttachmentReconciler) updateStatusWithRetry(ctx context.Context, att *gnwesv1alpha1.VMGPUAttachment, mutate func(*gnwesv1alpha1.VMGPUAttachment)) error {
+	key := client.ObjectKeyFromObject(att)
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var latest gnwesv1alpha1.VMGPUAttachment
+		if err := r.Get(ctx, key, &latest); err != nil {
+			return err
+		}
+		mutate(&latest)
+		if err := r.Status().Update(ctx, &latest); err != nil {
+			return err
+		}
+		*att = latest
+		return nil
+	})
+}
+
+// updateWithRetry is updateStatusWithRetry's counterpart for a (rare, only
+// at finalizer add/remove) non-status update: same conflict hazard, same
+// re-GET-and-reapply fix. mutate's finalizer calls are idempotent
+// (controllerutil.AddFinalizer/RemoveFinalizer are no-ops if already in the
+// wanted state), so reapplying them against a freshly-read copy is safe.
+func (r *VMGPUAttachmentReconciler) updateWithRetry(ctx context.Context, att *gnwesv1alpha1.VMGPUAttachment, mutate func(*gnwesv1alpha1.VMGPUAttachment)) error {
+	key := client.ObjectKeyFromObject(att)
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var latest gnwesv1alpha1.VMGPUAttachment
+		if err := r.Get(ctx, key, &latest); err != nil {
+			return err
+		}
+		mutate(&latest)
+		if err := r.Update(ctx, &latest); err != nil {
+			return err
+		}
+		*att = latest
+		return nil
+	})
+}
+
 func (r *VMGPUAttachmentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -92,8 +151,9 @@ func (r *VMGPUAttachmentReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					p.Release(att.Status.DeviceID, attachKey)
 				}
 			}
-			controllerutil.RemoveFinalizer(&att, vmgpuAttachmentFinalizer)
-			if err := r.Update(ctx, &att); err != nil {
+			if err := r.updateWithRetry(ctx, &att, func(a *gnwesv1alpha1.VMGPUAttachment) {
+				controllerutil.RemoveFinalizer(a, vmgpuAttachmentFinalizer)
+			}); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -102,8 +162,9 @@ func (r *VMGPUAttachmentReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	if !controllerutil.ContainsFinalizer(&att, vmgpuAttachmentFinalizer) {
-		controllerutil.AddFinalizer(&att, vmgpuAttachmentFinalizer)
-		if err := r.Update(ctx, &att); err != nil {
+		if err := r.updateWithRetry(ctx, &att, func(a *gnwesv1alpha1.VMGPUAttachment) {
+			controllerutil.AddFinalizer(a, vmgpuAttachmentFinalizer)
+		}); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, nil
@@ -115,9 +176,12 @@ func (r *VMGPUAttachmentReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	case gnwesv1alpha1.VMGPUDesiredDetached:
 		return r.reconcileDetach(ctx, &att, poolKey, attachKey, apiSocket, ch)
 	default:
-		att.Status.Phase = gnwesv1alpha1.VMGPUPhaseFailed
-		att.Status.Message = fmt.Sprintf("unknown desiredState %q", att.Spec.DesiredState)
-		return ctrl.Result{}, r.Status().Update(ctx, &att)
+		desiredState := att.Spec.DesiredState
+		err := r.updateStatusWithRetry(ctx, &att, func(a *gnwesv1alpha1.VMGPUAttachment) {
+			a.Status.Phase = gnwesv1alpha1.VMGPUPhaseFailed
+			a.Status.Message = fmt.Sprintf("unknown desiredState %q", desiredState)
+		})
+		return ctrl.Result{}, err
 	}
 }
 
@@ -130,9 +194,12 @@ func (r *VMGPUAttachmentReconciler) reconcileAttach(ctx context.Context, att *gn
 
 	p := r.VFIOManager.GetPool(poolKey)
 	if p == nil {
-		att.Status.Phase = gnwesv1alpha1.VMGPUPhasePending
-		att.Status.Message = fmt.Sprintf("waiting for VFIOGPUPool %q to exist", att.Spec.PoolRef)
-		return ctrl.Result{RequeueAfter: 250 * time.Millisecond}, r.Status().Update(ctx, att)
+		poolRef := att.Spec.PoolRef
+		err := r.updateStatusWithRetry(ctx, att, func(a *gnwesv1alpha1.VMGPUAttachment) {
+			a.Status.Phase = gnwesv1alpha1.VMGPUPhasePending
+			a.Status.Message = fmt.Sprintf("waiting for VFIOGPUPool %q to exist", poolRef)
+		})
+		return ctrl.Result{RequeueAfter: 250 * time.Millisecond}, err
 	}
 
 	var device vfiopool.Device
@@ -143,9 +210,11 @@ func (r *VMGPUAttachmentReconciler) reconcileAttach(ctx context.Context, att *gn
 		device, ok = p.Acquire(attachKey)
 	}
 	if !ok {
-		att.Status.Phase = gnwesv1alpha1.VMGPUPhasePending
-		att.Status.Message = "no VFIO device available yet; waiting for one to free up"
-		return ctrl.Result{RequeueAfter: 100 * time.Millisecond}, r.Status().Update(ctx, att)
+		err := r.updateStatusWithRetry(ctx, att, func(a *gnwesv1alpha1.VMGPUAttachment) {
+			a.Status.Phase = gnwesv1alpha1.VMGPUPhasePending
+			a.Status.Message = "no VFIO device available yet; waiting for one to free up"
+		})
+		return ctrl.Result{RequeueAfter: 100 * time.Millisecond}, err
 	}
 
 	info, err := ch.AddDevice(ctx, chclient.DeviceConfig{
@@ -167,26 +236,35 @@ func (r *VMGPUAttachmentReconciler) reconcileAttach(ctx context.Context, att *gn
 		// to resume the actor fresh (a new VM, a clean PCI bus) rather than
 		// keep retrying against the wedged one.
 		p.Release(device.ID, attachKey)
-		att.Status.Phase = gnwesv1alpha1.VMGPUPhaseFailed
-		att.Status.Message = fmt.Sprintf("vm.add-device failed for device %q: %v", device.ID, err)
-		return ctrl.Result{RequeueAfter: time.Second}, r.Status().Update(ctx, att)
+		addErr := err
+		err = r.updateStatusWithRetry(ctx, att, func(a *gnwesv1alpha1.VMGPUAttachment) {
+			a.Status.Phase = gnwesv1alpha1.VMGPUPhaseFailed
+			a.Status.Message = fmt.Sprintf("vm.add-device failed for device %q: %v", device.ID, addErr)
+		})
+		return ctrl.Result{RequeueAfter: time.Second}, err
 	}
 	if info.BDF != "" {
 		p.SetGuestBDF(device.ID, attachKey, info.BDF)
 	}
 
 	now := metav1.Now()
-	att.Status.Phase = gnwesv1alpha1.VMGPUPhaseAttached
-	att.Status.DeviceID = device.ID
-	att.Status.GuestBDF = info.BDF
-	att.Status.ObservedDesiredState = gnwesv1alpha1.VMGPUDesiredAttached
-	att.Status.LastTransitionAt = &now
-	att.Status.AttachLatencyMillis = time.Since(requestedAt).Milliseconds()
-	att.Status.Message = "attached"
+	attachLatencyMillis := time.Since(requestedAt).Milliseconds()
+	err = r.updateStatusWithRetry(ctx, att, func(a *gnwesv1alpha1.VMGPUAttachment) {
+		a.Status.Phase = gnwesv1alpha1.VMGPUPhaseAttached
+		a.Status.DeviceID = device.ID
+		a.Status.GuestBDF = info.BDF
+		a.Status.ObservedDesiredState = gnwesv1alpha1.VMGPUDesiredAttached
+		a.Status.LastTransitionAt = &now
+		a.Status.AttachLatencyMillis = attachLatencyMillis
+		a.Status.Message = "attached"
+	})
 	r.clearTransition(att.UID, gnwesv1alpha1.VMGPUDesiredAttached)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 
-	log.FromContext(ctx).Info("vmgpuattachment attached", "attachment", attachKey, "device", device.ID, "guestBDF", info.BDF, "attachMs", att.Status.AttachLatencyMillis)
-	return ctrl.Result{}, r.Status().Update(ctx, att)
+	log.FromContext(ctx).Info("vmgpuattachment attached", "attachment", attachKey, "device", device.ID, "guestBDF", info.BDF, "attachMs", attachLatencyMillis)
+	return ctrl.Result{}, nil
 }
 
 func (r *VMGPUAttachmentReconciler) reconcileDetach(ctx context.Context, att *gnwesv1alpha1.VMGPUAttachment, poolKey, attachKey, apiSocket string, ch CHDevicePlugger) (ctrl.Result, error) {
@@ -203,23 +281,27 @@ func (r *VMGPUAttachmentReconciler) reconcileDetach(ctx context.Context, att *gn
 	if att.Status.DeviceID == "" {
 		// Nothing attached (fresh object, or already detached): just record
 		// the desired state as observed.
-		if att.Status.Phase == "" {
-			att.Status.Phase = gnwesv1alpha1.VMGPUPhaseDetached
-		}
-		att.Status.ObservedDesiredState = gnwesv1alpha1.VMGPUDesiredDetached
-		return ctrl.Result{}, r.Status().Update(ctx, att)
+		err := r.updateStatusWithRetry(ctx, att, func(a *gnwesv1alpha1.VMGPUAttachment) {
+			if a.Status.Phase == "" {
+				a.Status.Phase = gnwesv1alpha1.VMGPUPhaseDetached
+			}
+			a.Status.ObservedDesiredState = gnwesv1alpha1.VMGPUDesiredDetached
+		})
+		return ctrl.Result{}, err
 	}
 
 	requestedAt := r.markTransitionStart(att.UID, gnwesv1alpha1.VMGPUDesiredDetached)
 
 	deviceID := att.Status.DeviceID
-	if err := ch.RemoveDevice(ctx, deviceID); err != nil && !r.vmGone(apiSocket) {
-		att.Status.Phase = gnwesv1alpha1.VMGPUPhaseFailed
-		att.Status.Message = fmt.Sprintf("vm.remove-device failed for device %q: %v", deviceID, err)
-		return ctrl.Result{RequeueAfter: time.Second}, r.Status().Update(ctx, att)
-	} else if err != nil {
+	if removeErr := ch.RemoveDevice(ctx, deviceID); removeErr != nil && !r.vmGone(apiSocket) {
+		err := r.updateStatusWithRetry(ctx, att, func(a *gnwesv1alpha1.VMGPUAttachment) {
+			a.Status.Phase = gnwesv1alpha1.VMGPUPhaseFailed
+			a.Status.Message = fmt.Sprintf("vm.remove-device failed for device %q: %v", deviceID, removeErr)
+		})
+		return ctrl.Result{RequeueAfter: time.Second}, err
+	} else if removeErr != nil {
 		log.FromContext(ctx).Info("vm.remove-device failed but the VM's own api-socket is gone; treating the device as already freed",
-			"attachment", attachKey, "device", deviceID, "apiSocket", apiSocket, "err", err)
+			"attachment", attachKey, "device", deviceID, "apiSocket", apiSocket, "err", removeErr)
 	}
 
 	if p := r.VFIOManager.GetPool(poolKey); p != nil {
@@ -227,17 +309,23 @@ func (r *VMGPUAttachmentReconciler) reconcileDetach(ctx context.Context, att *gn
 	}
 
 	now := metav1.Now()
-	att.Status.Phase = gnwesv1alpha1.VMGPUPhaseDetached
-	att.Status.DeviceID = ""
-	att.Status.GuestBDF = ""
-	att.Status.ObservedDesiredState = gnwesv1alpha1.VMGPUDesiredDetached
-	att.Status.LastTransitionAt = &now
-	att.Status.AttachLatencyMillis = time.Since(requestedAt).Milliseconds()
-	att.Status.Message = "detached"
+	detachLatencyMillis := time.Since(requestedAt).Milliseconds()
+	err := r.updateStatusWithRetry(ctx, att, func(a *gnwesv1alpha1.VMGPUAttachment) {
+		a.Status.Phase = gnwesv1alpha1.VMGPUPhaseDetached
+		a.Status.DeviceID = ""
+		a.Status.GuestBDF = ""
+		a.Status.ObservedDesiredState = gnwesv1alpha1.VMGPUDesiredDetached
+		a.Status.LastTransitionAt = &now
+		a.Status.AttachLatencyMillis = detachLatencyMillis
+		a.Status.Message = "detached"
+	})
 	r.clearTransition(att.UID, gnwesv1alpha1.VMGPUDesiredDetached)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 
-	log.FromContext(ctx).Info("vmgpuattachment detached", "attachment", attachKey, "device", deviceID, "detachMs", att.Status.AttachLatencyMillis)
-	return ctrl.Result{}, r.Status().Update(ctx, att)
+	log.FromContext(ctx).Info("vmgpuattachment detached", "attachment", attachKey, "device", deviceID, "detachMs", detachLatencyMillis)
+	return ctrl.Result{}, nil
 }
 
 // vmGone reports whether apiSocket's path no longer exists on this node's
