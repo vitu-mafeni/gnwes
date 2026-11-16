@@ -1,0 +1,32 @@
+# Real-GPU-workload smoke test for the Exclusive tier: runs the real
+# nvidia-smi binary (not a ko-built Go app) inside an actor container,
+# on the same gnwes-counter-exclusive WorkerPool already proven to
+# hot-attach a real GPU and expose working /dev/nvidia* nodes -- see
+# config/vmgpu/nvidia-smi-test/ for how the image is built, and
+# config/vmgpu/README.md's 2026-11-16 "real GPU workload" entry for
+# what this confirmed.
+#
+# No wakeupProbe: optional on a Container (agent-substrate's
+# api/ateapi/v1/ateapi.proto's own doc comment: "Without it, ResumeActor
+# returns as soon as the container has started"), and this test has no
+# HTTP server to probe anyway -- output goes to the worker pod's own
+# stdout instead (see entrypoint.sh).
+#
+# Not a Kubernetes CRD: create with
+#   kubectl-ate create actor-template -f gnwes-nvidia-smi-template.yaml.tmpl
+# after resolving <image> to the real pushed Harbor reference.
+metadata:
+  atespace: ate-demo-counter
+  name: gnwes-nvidia-smi
+workerSelector:
+  matchLabels:
+    workload: gnwes-counter-exclusive
+containers:
+- name: nvidia-smi
+  image: <resolved Harbor image -- see config/vmgpu/nvidia-smi-test/README.md>
+  command:
+  - /entrypoint.sh
+resources:
+  limits:
+    cpuMillicores: 500
+    memoryBytes: 268435456 # 256Mi

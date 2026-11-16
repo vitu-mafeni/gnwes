@@ -32,6 +32,14 @@ RUSTFS_ENDPOINT="${RUSTFS_ENDPOINT:-http://10.9.0.13:31429}"
 RUSTFS_BUCKET="${RUSTFS_BUCKET:-ate-snapshots}"
 AWS_CLI_IMAGE="amazon/aws-cli:2.38.5@sha256:c8156a0e74e13929a42d7e60f0d4e14e7d28d980cd21822505d4bff80e5460c1"
 
+# Computed here, before any `cd` below, and never recomputed: resolving
+# ${BASH_SOURCE[0]} later (e.g. at step 5b) would resolve against
+# whatever directory the script's own `cd`s (step 1 into $WORKDIR,
+# step 3 into tools/packaging/kernel, ...) have left the shell in by
+# then, not against where the script was actually invoked from --
+# confirmed live (2026-11-16): that produced "go.mod file not found".
+GNWES_REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+
 echo "== 1. clone kata-containers at the version this cluster already uses =="
 mkdir -p "$WORKDIR" && cd "$WORKDIR"
 if [ ! -d kata-containers ]; then
@@ -39,14 +47,27 @@ if [ ! -d kata-containers ]; then
 fi
 cd kata-containers
 
-echo "== 2. pin the NVIDIA kernel-module source to THIS HOST's exact installed driver version =="
+echo "== 2. pin the NVIDIA kernel-module source to a chosen driver version =="
 # versions.yaml ships pinned to whatever upstream last set (confirmed
 # 2026-11-15: that was 615.71.09, newer than any driver this host has).
 # NVIDIA kernel modules and userspace libraries MUST be the exact same
 # version -- building against the wrong one fails at module init, not
 # at compile time, so get this right before building anything.
-HOST_DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
-echo "host driver version: $HOST_DRIVER_VERSION"
+#
+# Defaulting to the HOST's own installed version is a convenience, not
+# a requirement: this GPU is handed to vfio-pci at boot and the host's
+# own nvidia.ko never touches it, so there is no technical coupling
+# between the guest's driver version and whatever the host happens to
+# have installed -- only between the GUEST's kernel module and the
+# GUEST's own userspace libraries (nvidia-smi, libnvidia-ml.so, ...),
+# which must still match each other exactly. Defaulting to the host's
+# version just means its already-installed, already-version-matched
+# userspace libraries are the easiest ones to test against right now.
+# TODO: decouple from the host for real -- pass NVIDIA_DRIVER_VERSION
+# explicitly and fetch that version's userspace libraries from
+# NVIDIA's own distribution instead of copying the host's.
+HOST_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)}"
+echo "guest driver version: $HOST_DRIVER_VERSION"
 if ! curl -fs "https://api.github.com/repos/NVIDIA/open-gpu-kernel-modules/tags?per_page=100" \
      | python3 -c "import json,sys; print('\n'.join(t['name'] for t in json.load(sys.stdin)))" \
      | grep -qx "$HOST_DRIVER_VERSION"; then
@@ -78,7 +99,7 @@ fi
 [ "$(sha256sum rootfs.img | cut -d' ' -f1)" = "$STOCK_SHA" ] || { echo "ERROR: stock rootfs sha256 mismatch" >&2; exit 1; }
 
 echo "== 5. get kmod + libkmod matching the GUEST's distro (NOT the host's -- ABI must match the guest's libc) =="
-GUEST_UBUNTU_CODENAME=$(mkdir -p /tmp/.rootfs-peek && sudo mount -o loop,ro "$(losetup -fP --show rootfs.img)" /tmp/.rootfs-peek 2>/dev/null; . /tmp/.rootfs-peek/etc/os-release 2>/dev/null; echo "$VERSION_ID"; sudo umount /tmp/.rootfs-peek 2>/dev/null; sudo losetup -D 2>/dev/null)
+GUEST_UBUNTU_CODENAME=$(mkdir -p /tmp/.rootfs-peek && sudo mount -o loop,ro "$(sudo losetup -fP --show rootfs.img)" /tmp/.rootfs-peek 2>/dev/null; . /tmp/.rootfs-peek/etc/os-release 2>/dev/null; echo "${VERSION_ID:-}"; sudo umount /tmp/.rootfs-peek 2>/dev/null; sudo losetup -D 2>/dev/null)
 mkdir -p "$WORKDIR/kmod-pkg" && cd "$WORKDIR/kmod-pkg"
 if [ ! -f kmod-extracted/usr/bin/kmod ]; then
   sudo docker run --rm -v "$PWD:/out" "ubuntu:${GUEST_UBUNTU_CODENAME:-26.04}" bash -c \
@@ -96,13 +117,60 @@ echo "== 5b. build gnwes-nsdbg, a static helper the init wrapper uses to create 
 # produces a binary with no ELF interpreter to resolve, which is the
 # actual fix; see cmd/nsdbg/main.go's own doc comment for the complete
 # explanation.
-GNWES_REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$WORKDIR/gnwes-nsdbg" -C "$GNWES_REPO_ROOT" ./cmd/nsdbg
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -C "$GNWES_REPO_ROOT" -o "$WORKDIR/gnwes-nsdbg" ./cmd/nsdbg
 file "$WORKDIR/gnwes-nsdbg" | grep -q 'statically linked' || { echo "ERROR: gnwes-nsdbg is not statically linked" >&2; exit 1; }
 
 echo "== 6. assemble the custom rootfs: stock image + kmod/libkmod + our modules + autoload config =="
 cp "$WORKDIR/stock-rootfs/rootfs.img" "$WORKDIR/stock-rootfs/rootfs-nvidia.img"
+
+# Grow the image, its partition and its filesystem before mounting:
+# the stock rootfs ships with only ~23MB of free space, nowhere near
+# enough for the ~29MB GSP firmware blob this GPU needs on top of
+# everything else already added here -- confirmed live (2026-11-16),
+# "cp: error writing ... gsp_tu10x.bin: No space left on device".
+# +128MB gives generous headroom for this and future additions.
+#
+# Partition 1 (the rootfs) is NOT the last partition on this image --
+# confirmed live (2026-11-16): a second, small (~3MB) partition
+# follows it immediately, with no recognizable filesystem (an
+# unidentified reserved/verity-like region), which blocks the usual
+# "just grow the last partition" idiom (`sfdisk -N 1` with size "+"
+# had no effect here: there is no gap to grow into before partition 2
+# starts). So: back partition 2's raw bytes up, move it to the new end
+# of the grown disk, and grow partition 1 to fill the space freed up
+# in between. This is safe regardless of what partition 2 actually is,
+# because its PARTUUID is derived from the disk id + partition NUMBER
+# (confirmed via `blkid`), not its position -- anything that refers to
+# it by PARTUUID is unaffected by moving it.
+GROW_MB=128
+truncate -s "+${GROW_MB}M" "$WORKDIR/stock-rootfs/rootfs-nvidia.img"
 LOOPDEV=$(sudo losetup -fP --show "$WORKDIR/stock-rootfs/rootfs-nvidia.img")
+
+SFDISK_DUMP=$(sudo sfdisk -d "$LOOPDEV")
+P1_START=$(echo "$SFDISK_DUMP" | awk -F'[ =,]+' '/p1 :/{for(i=1;i<=NF;i++) if($i=="start") print $(i+1)}')
+P2_START=$(echo "$SFDISK_DUMP" | awk -F'[ =,]+' '/p2 :/{for(i=1;i<=NF;i++) if($i=="start") print $(i+1)}')
+P2_SIZE=$(echo "$SFDISK_DUMP" | awk -F'[ =,]+' '/p2 :/{for(i=1;i<=NF;i++) if($i=="size") print $(i+1)}')
+sudo dd if="${LOOPDEV}p2" of="$WORKDIR/stock-rootfs/p2-backup.bin" bs=512 status=none
+
+TOTAL_SECTORS=$(sudo blockdev --getsz "$LOOPDEV")
+P1_SIZE_NEW=$((TOTAL_SECTORS - P1_START - P2_SIZE))
+P2_START_NEW=$((TOTAL_SECTORS - P2_SIZE))
+
+sudo sfdisk "$LOOPDEV" <<SFDISK
+label: dos
+device: $LOOPDEV
+unit: sectors
+
+${LOOPDEV}p1 : start=${P1_START}, size=${P1_SIZE_NEW}, type=83, bootable
+${LOOPDEV}p2 : start=${P2_START_NEW}, size=${P2_SIZE}, type=83
+SFDISK
+
+sudo losetup -d "$LOOPDEV"
+LOOPDEV=$(sudo losetup -fP --show "$WORKDIR/stock-rootfs/rootfs-nvidia.img")
+sudo dd if="$WORKDIR/stock-rootfs/p2-backup.bin" of="${LOOPDEV}p2" bs=512 status=none
+sudo e2fsck -fy "${LOOPDEV}p1"
+sudo resize2fs "${LOOPDEV}p1"
+
 sudo mkdir -p /mnt/nvidia-rootfs
 sudo mount -o rw "${LOOPDEV}p1" /mnt/nvidia-rootfs
 
@@ -129,6 +197,28 @@ sudo rm -rf "$DST"
 sudo mkdir -p "$DST/kernel/drivers/video"
 sudo cp "$SRC/kernel/drivers/video/"*.ko "$DST/kernel/drivers/video/"
 sudo cp "$SRC"/modules.* "$DST/"
+
+echo "== 6a. copy the GSP firmware blob(s) the open kernel modules need at runtime =="
+# Confirmed live (2026-11-16) via the guest debug console: nvidia.ko
+# loads and DOES bind to the PCI device (/sys/bus/pci/devices/.../driver
+# -> .../drivers/nvidia), but RmInitAdapter fails on every single retry
+# with "Direct firmware load for nvidia/<version>/gsp_tu10x.bin failed
+# with error -2" / "NVRM: RmFetchGspRmImages: No firmware image found" --
+# nvidia-smi then reports the DIFFERENT error "No devices were found"
+# (driver communicable, zero GPUs) instead of "couldn't communicate with
+# the NVIDIA driver" (no major at all), which is what distinguishes this
+# from the earlier CPID/poll-timeout bugs. NVIDIA's open-source kernel
+# modules need a per-architecture GSP (GPU System Processor) firmware
+# blob at /lib/firmware/nvidia/<version>/gsp_*.bin for Turing+ GPUs
+# (this cluster's GPU is a TITAN RTX, Turing -> gsp_tu10x.bin) to
+# complete GPU init, and nothing before this step ever put one in the
+# guest rootfs. Copying the whole host version directory, not just the
+# one blob this GPU needs, keeps this working if the cluster's GPU
+# model changes later.
+HOST_FW_DIR="/lib/firmware/nvidia/${HOST_DRIVER_VERSION}"
+[ -d "$HOST_FW_DIR" ] || { echo "ERROR: $HOST_FW_DIR not found on this host -- install the matching nvidia driver package here first" >&2; exit 1; }
+sudo mkdir -p "/mnt/nvidia-rootfs/lib/firmware/nvidia/${HOST_DRIVER_VERSION}"
+sudo cp -a "$HOST_FW_DIR"/. "/mnt/nvidia-rootfs/lib/firmware/nvidia/${HOST_DRIVER_VERSION}/"
 
 sudo mkdir -p /mnt/nvidia-rootfs/etc/modules-load.d
 printf 'nvidia\nnvidia-uvm\nnvidia-modeset\nnvidia-drm\n' | sudo tee /mnt/nvidia-rootfs/etc/modules-load.d/nvidia.conf >/dev/null
@@ -193,8 +283,19 @@ if [ ! -f /mnt/nvidia-rootfs/usr/bin/kata-agent.real ]; then
   cat <<'WRAPPER' | sudo tee /mnt/nvidia-rootfs/usr/bin/kata-agent >/dev/null
 #!/bin/sh
 (
+  # 150 * 0.2s = 30s was NOT enough margin: a genuine guest console
+  # dmesg (2026-11-16) showed the GPU's PCI hot-attach only completing
+  # at guest uptime ~47s ("pci 0000:00:07.0: [10de:1e02] ... PCIe
+  # Legacy Endpoint"), i.e. AFTER this loop had already given up and
+  # broken out without ever running modprobe -- NVIDIA_MAJOR then
+  # stayed empty for the rest of boot, so the (correct, working)
+  # nvidia.ko and mknod/CPID logic below never even got a chance to
+  # run. Confirmed live: nvidia.ko loads cleanly with no real errors
+  # once modprobe is actually invoked (manual `modprobe -v nvidia`
+  # after boot succeeded instantly). 600 * 0.2s = 120s gives ~2.5x
+  # margin over the observed 47s attach latency.
   i=0
-  while [ "$i" -lt 150 ]; do
+  while [ "$i" -lt 600 ]; do
     if grep -qs '^0x10de$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then
       for m in nvidia nvidia-uvm nvidia-modeset nvidia-drm; do
         /usr/sbin/modprobe "$m" 2>/dev/null
@@ -216,12 +317,31 @@ if [ ! -f /mnt/nvidia-rootfs/usr/bin/kata-agent.real ]; then
   UVM_MAJOR=$(awk '$2=="nvidia-uvm" {print $1}' /proc/devices)
 
   if [ -n "$NVIDIA_MAJOR" ]; then
+    # Find the container's own init PID by its mount namespace, not by
+    # matching its binary's path. An earlier version of this wrapper
+    # grepped /proc/*/cmdline for the literal string "/ko-app/" (the
+    # convention ko-built Go binaries' paths always have) -- that only
+    # ever matched this project's own ko-built demo apps. Confirmed live
+    # (2026-11-16): a non-ko-built actor container (a plain Ubuntu image
+    # running /entrypoint.sh, built for a real-GPU-workload smoke test)
+    # never matched, so CPID stayed empty, the mknod block below never
+    # ran, and the container's /dev never got its NVIDIA device nodes --
+    # NVML then fails with "couldn't communicate with the NVIDIA driver"
+    # even though the host-side cgroup allow-rule and the guest kernel
+    # module are both fine. A container is just any process with a
+    # mount namespace different from this wrapper's own (this project's
+    # single-actor-per-worker-pod model means there is only ever one),
+    # which identifies it correctly regardless of what binary it runs.
+    SELF_MNTNS=$(readlink /proc/self/ns/mnt)
     CPID=""
     k=0
     while [ "$k" -lt 150 ] && [ -z "$CPID" ]; do
       for p in /proc/[0-9]*; do
-        if grep -qs '/ko-app/' "$p/cmdline" 2>/dev/null; then
-          CPID="${p#/proc/}"
+        pid="${p#/proc/}"
+        [ "$pid" = "1" ] && continue
+        ns=$(readlink "$p/ns/mnt" 2>/dev/null) || continue
+        if [ -n "$ns" ] && [ "$ns" != "$SELF_MNTNS" ]; then
+          CPID="$pid"
           break
         fi
       done
