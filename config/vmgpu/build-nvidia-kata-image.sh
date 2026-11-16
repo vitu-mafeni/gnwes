@@ -87,6 +87,19 @@ if [ ! -f kmod-extracted/usr/bin/kmod ]; then
   sudo chown -R root:root kmod-extracted
 fi
 
+echo "== 5b. build gnwes-nsdbg, a static helper the init wrapper uses to create /dev/nvidia* nodes inside the actor container =="
+# Why a bespoke static binary rather than coreutils' own mknod: confirmed
+# live (2026-11-16) on dcn-gpu-0 that neither the guest's own /usr/bin/mknod
+# (dynamically linked) nor busybox (statically linked, but dispatches by
+# argv[0], which nsenter always sets to its own literal exec path) works
+# here -- see install_init_wrapper below for the full story. CGO_ENABLED=0
+# produces a binary with no ELF interpreter to resolve, which is the
+# actual fix; see cmd/nsdbg/main.go's own doc comment for the complete
+# explanation.
+GNWES_REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$WORKDIR/gnwes-nsdbg" -C "$GNWES_REPO_ROOT" ./cmd/nsdbg
+file "$WORKDIR/gnwes-nsdbg" | grep -q 'statically linked' || { echo "ERROR: gnwes-nsdbg is not statically linked" >&2; exit 1; }
+
 echo "== 6. assemble the custom rootfs: stock image + kmod/libkmod + our modules + autoload config =="
 cp "$WORKDIR/stock-rootfs/rootfs.img" "$WORKDIR/stock-rootfs/rootfs-nvidia.img"
 LOOPDEV=$(sudo losetup -fP --show "$WORKDIR/stock-rootfs/rootfs-nvidia.img")
@@ -119,6 +132,10 @@ sudo cp "$SRC"/modules.* "$DST/"
 
 sudo mkdir -p /mnt/nvidia-rootfs/etc/modules-load.d
 printf 'nvidia\nnvidia-uvm\nnvidia-modeset\nnvidia-drm\n' | sudo tee /mnt/nvidia-rootfs/etc/modules-load.d/nvidia.conf >/dev/null
+
+sudo mkdir -p /mnt/nvidia-rootfs/usr/local/bin
+sudo cp "$WORKDIR/gnwes-nsdbg" /mnt/nvidia-rootfs/usr/local/bin/gnwes-nsdbg
+sudo chmod 755 /mnt/nvidia-rootfs/usr/local/bin/gnwes-nsdbg
 # nvidia-peermem deliberately omitted: GPUDirect RDMA only, not needed
 # for a single-GPU actor and not auto-loaded by default upstream either.
 # /etc/modules-load.d/nvidia.conf above is only honored by
@@ -152,6 +169,25 @@ echo "== 6b. install_init_wrapper: this rootfs's /usr/sbin/init -> systemd is ne
 # only for its own container-device-injection bookkeeping, never for
 # driver binding). So: poll for the device appearing instead of a
 # one-shot modprobe at boot.
+# Beyond loading the driver in the guest kernel, the counter app's own
+# container needs the device NODES themselves: a container's /dev is its
+# own private tmpfs (confirmed from the OCI spec kata-agent logs at
+# container-create time), never shared with the guest root's /dev, so
+# nothing created in guest root's /dev is ever visible inside it. The
+# matching cgroup device-allow rule must come from the HOST side
+# (agent-substrate's internal/ocispec.guestResources -- a wildcard
+# char-device rule there, since nvidia-uvm's major is assigned
+# dynamically by the guest kernel and the host-side Go code has no way
+# to know it ahead of time) and is baked in at container-creation time,
+# before the GPU even hot-attaches -- this guest-side wrapper only needs
+# to mknod the actual device files, once the real majors are known
+# (read from /proc/devices, never hardcoded: NVIDIA's majors are
+# conventionally fixed but confirming via /proc/devices costs nothing
+# and is simply correct), inside the actor container's own mount
+# namespace (found by matching any ko-built binary's conventional
+# /ko-app/<name> path under /proc -- this project's single-actor-per-
+# worker-pod model means there is only ever one such container to
+# find).
 if [ ! -f /mnt/nvidia-rootfs/usr/bin/kata-agent.real ]; then
   sudo mv /mnt/nvidia-rootfs/usr/bin/kata-agent /mnt/nvidia-rootfs/usr/bin/kata-agent.real
   cat <<'WRAPPER' | sudo tee /mnt/nvidia-rootfs/usr/bin/kata-agent >/dev/null
@@ -168,6 +204,100 @@ if [ ! -f /mnt/nvidia-rootfs/usr/bin/kata-agent.real ]; then
     i=$((i + 1))
     sleep 0.2
   done
+
+  NVIDIA_MAJOR=""
+  j=0
+  while [ "$j" -lt 150 ]; do
+    NVIDIA_MAJOR=$(awk '$2=="nvidia" {print $1}' /proc/devices)
+    [ -n "$NVIDIA_MAJOR" ] && break
+    j=$((j + 1))
+    sleep 0.2
+  done
+  UVM_MAJOR=$(awk '$2=="nvidia-uvm" {print $1}' /proc/devices)
+
+  if [ -n "$NVIDIA_MAJOR" ]; then
+    CPID=""
+    k=0
+    while [ "$k" -lt 150 ] && [ -z "$CPID" ]; do
+      for p in /proc/[0-9]*; do
+        if grep -qs '/ko-app/' "$p/cmdline" 2>/dev/null; then
+          CPID="${p#/proc/}"
+          break
+        fi
+      done
+      [ -n "$CPID" ] && break
+      k=$((k + 1))
+      sleep 0.2
+    done
+    echo "GNWES_GPU_WRAPPER: nvidia_major=${NVIDIA_MAJOR} uvm_major=${UVM_MAJOR:-none} container_pid=${CPID:-none}"
+    if [ -n "$CPID" ]; then
+      # The actor container has no shell and no coreutils at all
+      # (confirmed live: "nsenter: failed to execute sh: No such file
+      # or directory" -- a minimal ko-built image, intentionally
+      # driver-less and shell-less). The real fix (confirmed live,
+      # 2026-11-16, via kata's own debug console -- see
+      # config/vmgpu/README.md's "nsenter into a minimal container"
+      # entry for the full investigation) needs BOTH of these, neither
+      # of which this wrapper did before:
+      #
+      # 1. `--pid`, not just `--mount` (and NOT `--root`, which was a
+      #    red herring). nsenter only gives its own *forked child* real
+      #    membership in the target pid namespace (setns can't move the
+      #    calling process itself into a new PID ns; this util-linux
+      #    version forks by default whenever --pid is given -- no
+      #    separate --fork flag exists). Without it, a target whose
+      #    mount namespace carries its own pid-namespace-scoped procfs
+      #    mount makes "/proc/self" (and so /proc/self/fd/N) resolve to
+      #    nothing, failing exec with ENOENT even though the file being
+      #    exec'd is genuinely present and correctly permissioned.
+      # 2. A genuinely static binary, not a copy of the guest's own
+      #    dynamically-linked /usr/bin/mknod or /usr/bin/ls. Once (1) is
+      #    fixed, a dynamically-linked binary STILL fails with the exact
+      #    same ENOENT: the kernel resolves its ELF interpreter
+      #    (/lib64/ld-linux-*.so.2) against the TARGET namespace's own
+      #    rootfs post-setns, and this actor container's rootfs has no
+      #    such path. busybox (also static) gets past exec but then
+      #    fails its own argv[0]-based applet dispatch, because nsenter
+      #    always execs via a literal path whose basename is never a
+      #    recognized applet name -- hence gnwes-nsdbg
+      #    (cmd/nsdbg/main.go, built with CGO_ENABLED=0, embedded into
+      #    this image at /usr/local/bin/gnwes-nsdbg by this same build
+      #    script), a single static binary with no argv[0] dispatch.
+      #
+      # The copy into the rootfs bind-mount source (visible from guest
+      # root at /run/kata-containers/shared/containers/c_*/rootfs, the
+      # exact backing files the container sees as its own "/") is a
+      # plain bind mount, confirmed from kata-agent's own
+      # create_container RPC log, and a file placed there IS visible
+      # inside the container afterward (contrary to an earlier,
+      # disproven overlayfs-snapshot hypothesis) -- the missing piece
+      # was only ever nsenter's own namespace/exec handling, never this
+      # copy step. Reference it from inside the container by its short,
+      # root-relative path (e.g. "/gnwes-nsdbg"): the long
+      # /run/kata-containers/... path is only meaningful from GUEST
+      # ROOT's view, before nsenter switches "/" to the container's own
+      # root. Never place the helper under /tmp, /dev, /proc, /sys:
+      # those are separate mounts layered over the rootfs inside the
+      # container and would hide it.
+      ROOTFS_SRC=$(ls -d /run/kata-containers/shared/containers/c_*/rootfs 2>/dev/null | head -1)
+      echo "GNWES_GPU_WRAPPER: rootfs_src=${ROOTFS_SRC:-none}"
+      if [ -n "$ROOTFS_SRC" ]; then
+        cp /usr/local/bin/gnwes-nsdbg "$ROOTFS_SRC/gnwes-nsdbg" 2>/run/gnwes-gpu-mknod.out
+        chmod 755 "$ROOTFS_SRC/gnwes-nsdbg" 2>>/run/gnwes-gpu-mknod.out
+        nsenter --target "$CPID" --mount --pid -- /gnwes-nsdbg mknod /dev/nvidiactl c "$NVIDIA_MAJOR" 255 666 >>/run/gnwes-gpu-mknod.out 2>&1
+        nsenter --target "$CPID" --mount --pid -- /gnwes-nsdbg mknod /dev/nvidia0 c "$NVIDIA_MAJOR" 0 666 >>/run/gnwes-gpu-mknod.out 2>&1
+        if [ -n "$UVM_MAJOR" ]; then
+          nsenter --target "$CPID" --mount --pid -- /gnwes-nsdbg mknod /dev/nvidia-uvm c "$UVM_MAJOR" 0 666 >>/run/gnwes-gpu-mknod.out 2>&1
+        fi
+        nsenter --target "$CPID" --mount --pid -- /gnwes-nsdbg ls /dev >>/run/gnwes-gpu-mknod.out 2>&1
+        rm -f "$ROOTFS_SRC/gnwes-nsdbg" 2>/dev/null
+        echo "GNWES_GPU_WRAPPER: mknod attempts done, output follows:"
+        cat /run/gnwes-gpu-mknod.out
+      fi
+    fi
+  else
+    echo "GNWES_GPU_WRAPPER: never found an NVIDIA major in /proc/devices, giving up"
+  fi
 ) &
 exec /usr/bin/kata-agent.real "$@"
 WRAPPER

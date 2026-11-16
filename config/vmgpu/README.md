@@ -538,6 +538,200 @@ behind it is unit-tested (see `internal/substratebridge/kubectlate_test.go`).
       project's workflow; this doc and `REPRODUCTION-GUIDE.md` are the
       source of truth for what a fresh machine needs, not an assumption
       that `git log` implies deployment.
+  - **Container-level GPU device access, confirmed working end to end
+    (2026-11-16): the actor container's own `/dev/nvidiactl`,
+    `/dev/nvidia0`, `/dev/nvidia-uvm` now exist automatically on every
+    cold boot, with the cgroup permissions to actually open them.**
+    `nvidia.ko` binding inside the guest kernel (above) was never the
+    whole story: a container's `/dev` is its own private tmpfs,
+    confirmed from kata-agent's own OCI spec dump
+    (`Mount { destination: "/dev", typ: Some("tmpfs"), ... }`) — never
+    shared with guest root's `/dev`, so nothing created there was ever
+    visible inside the actor's container, and `nvidia-smi`-style tools
+    inside it saw nothing even though the driver was genuinely loaded
+    one mount namespace over. Two separate fixes were needed, on two
+    separate sides of the host/guest boundary:
+    - **The cgroup side (host, before the container is ever created):**
+      `agent-substrate`'s `internal/ocispec/microvm.go` builds the
+      kata container's device cgroup allowlist once, at
+      container-creation time, well before the GPU ever hot-attaches —
+      there is no RPC anywhere in this project to update an
+      already-running container's device cgroup later. Extended
+      `guestResources()` there with an allow-all-char-devices rule
+      (`dev("c", 0, -1, "rwm")`), rather than enumerating
+      `/dev/nvidia0`/`/dev/nvidiactl`'s conventional major (195)
+      specifically: `/dev/nvidia-uvm`'s major is assigned *dynamically*
+      by the guest kernel at module-load time (confirmed live:
+      `uvm_major=239` this session, which is not a fixed, documented
+      value), and this host-side Go code has no way to know it ahead of
+      time. This widens the allowlist for every microvm container
+      regardless of tier, but is only ever exercisable on the
+      Exclusive tier, where no real device node other than NVIDIA's own
+      driver is ever created in the guest — an accepted, deliberate
+      tradeoff, not a general container-escape surface (see that
+      function's own doc comment for the full reasoning).
+    - **The device-node side (guest, once the driver is loaded and the
+      container exists):** the init wrapper (above) must create the
+      actual `/dev/nvidiactl`/`/dev/nvidia0`/`/dev/nvidia-uvm` nodes
+      *inside* the actor container's own mount namespace, found by its
+      conventional `/ko-app/<name>` cmdline path (this project's
+      single-actor-per-worker-pod model means there is only ever one
+      such container). This is a plain `nsenter --mount --pid --
+      mknod ...` call conceptually, but getting this to actually
+      succeed, rather than failing with a flatly misleading `nsenter:
+      failed to execute <path>: No such file or directory` on every
+      attempt, needed two real, non-obvious fixes neither flag's own
+      man page mentions together, both confirmed live and reproducible:
+      1. **`--pid` is required, not just `--mount`** (and *not*
+         `--root`, which earlier attempts also tried — a red herring).
+         `setns(CLONE_NEWPID)` only gives *subsequently created
+         children* real membership in the target PID namespace — never
+         the calling process itself (this is documented kernel
+         behavior, just easy to miss) — and this project's `nsenter`
+         (util-linux 2.37+) auto-forks a child whenever `--pid` is
+         given, with no separate `--fork` flag to ask for it explicitly
+         (older util-linux versions do have one; this cluster's does
+         not, and passing it errors `unrecognized option`). Without
+         `--pid`, once `--mount` switches the process into a namespace
+         whose `/proc` is itself scoped to a different PID namespace,
+         `/proc/self` (and so `/proc/self/fd/N`) resolves to nothing —
+         exec fails with ENOENT even though the file being exec'd is
+         genuinely present and correctly permissioned on the other
+         side, which is what made this look like a filesystem-content
+         problem for a long time. `--mount` alone *is* correct and
+         sufficient for an ordinary container that has no further
+         nested PID namespace of its own (confirmed: worked first try
+         against the worker container's own namespace) — the PID
+         mismatch only bites once the target has unshared its PID
+         namespace too, as a kata container (and, separately,
+         `virtiofsd --sandbox=namespace`'s own sandboxed child) does.
+      2. **The binary being exec'd must be genuinely, statically
+         linked** — not a copy of the guest's own `/usr/bin/mknod` or
+         `/usr/bin/ls` (both dynamically linked against the guest's
+         glibc), and not busybox either, despite busybox itself being
+         static. Once (1) is fixed, a *dynamically* linked binary still
+         fails with the exact same ENOENT: the kernel resolves its ELF
+         interpreter (`/lib64/ld-linux-x86-64.so.2`) against the
+         *target* namespace's own rootfs, post-`setns` — and this
+         actor's rootfs, a minimal `ko`-built image with no shell and
+         no coreutils at all (confirmed earlier: `nsenter: failed to
+         execute sh: No such file or directory`), has no such path.
+         Busybox gets past the exec step (it genuinely has no
+         interpreter to resolve) but then fails on its own argv[0]-
+         based applet dispatch (`3: applet not found`): `nsenter`
+         always execs via a literal path (either the plain target path,
+         or `/proc/self/fd/N` when pre-opening a file descriptor to
+         sidestep the target namespace not having the file at all), and
+         that path's basename is never a recognized applet name, nor
+         literally `busybox` — busybox's own dispatch logic only
+         shifts to treating the next argument as the applet name when
+         `argv[0]`'s basename is exactly `busybox`, not for any other
+         unrecognized name. The actual fix: `cmd/nsdbg` — a tiny,
+         bespoke Go binary built with `CGO_ENABLED=0` (confirmed via
+         `file`: "statically linked", no ELF interpreter at all) with
+         `ls`/`mknod`/`cat`/`dial`/`install` subcommands, invoked as an
+         explicit CLI argument rather than via any argv[0] dispatch.
+         `build-nvidia-kata-image.sh` now builds and embeds it into the
+         rootfs image at `/usr/local/bin/gnwes-nsdbg`; the init wrapper
+         copies it into the actor container's rootfs bind-mount source
+         (confirmed, contrary to an earlier, disproven
+         overlayfs-snapshot hypothesis, to be a *plain bind mount* —
+         visible from guest root at
+         `/run/kata-containers/shared/containers/c_*/rootfs`, the exact
+         same backing files the container sees as its own `/`) before
+         `nsenter`ing into it, so the container has a real, working
+         static binary to exec at a short, root-relative path (e.g.
+         `/gnwes-nsdbg`) — then removes it afterward, keeping the
+         container's own rootfs as driver-less and shell-less as it
+         started.
+    - **How this was actually debugged, since blind rebuild→reupload→
+      recreate-actor cycles (10-20+ minutes each) made iterating on the
+      wrapper script itself impractical**: enabled Kata's own debug
+      console (vsock port 1026, `kata.WithAgentDebug`'s kernel params,
+      `--guest-debug` on `ateworker-microvm`) for a real interactive
+      shell *inside the guest*, reachable in seconds rather than
+      minutes. No `WorkerPool` CRD field exists for this (nor should
+      one — it is a debugging stopgap), so
+      `cmd/atecontroller/internal/controllers/workerpool_apply.go`
+      gates `--guest-debug` behind a `gnwes.io/guest-debug=true`
+      annotation on the `WorkerPool` object itself (not its pod
+      template) — `kubectl annotate workerpool <name>
+      gnwes.io/guest-debug=true`, with no CRD/API surface change. A
+      direct `kubectl patch` of the Deployment's `args` was tried
+      first and confirmed **not** to survive: `atecontroller` owns that
+      field via Server-Side-Apply and reverted it within 5 seconds of
+      the patch landing, before even one `sleep 5` had elapsed — hence
+      patching the annotation-reading logic into `atecontroller` itself
+      instead (same `ko build`+`skopeo push`+redeploy cycle already
+      established for `ateworker-microvm`).
+      **Turning this on crashed the guest outright at first** — a
+      real, separate, now-fixed bug, not a guess: the console log
+      showed a general-protection-fault inside kata-agent's own
+      `slog-async-logg` thread within ~1.4s of boot, the kernel then
+      panicking with "Attempted to kill init!" and rebooting in a loop.
+      `kata.WithAgentDebug` (`cmd/ateworker-microvm/internal/kata/
+      config.go`) coupled the debug console with `agent.log=debug`
+      unconditionally — the louder log level, not the console itself,
+      is what crashed kata-agent 4.3.1 here. The console doesn't need
+      verbose logging to be useful; the fix is `agent.log=info` instead,
+      keeping only `agent.debug_console agent.debug_console_vport=1026`.
+      Once reachable, the console was dialed exactly the way
+      `DebugConsoleDump` already does it (`CONNECT 1026\n`, read the
+      `OK <n>` line, then a sentinel-wrapped shell command,
+      `{ cmd ; } 2>&1; echo __ATE''_END__` — split by `''` so the
+      shell's own echo of the command line, not just its output,
+      doesn't trip the end-of-output sentinel) — but driven directly
+      from a raw Go program (`cmd/nsdbg dial`) rather than through
+      `ateworker-microvm` itself, since `clh.sock` lives inside the
+      *worker* container's own mount namespace on the host, reachable
+      the same `nsenter --mount --pid` way as everything else here.
+    - **virtiofsd's own backing directory is not the same path as its
+      guest-side mount point — confirmed the hard way, cost several
+      failed `nsenter` attempts before being found.** The guest mounts
+      its share at `/run/kata-containers/shared/containers` (this
+      project's own `GuestSharedDir` constant), but the HOST-side
+      source virtiofsd actually serves from — found by grepping its own
+      `/proc/<pid>/cmdline` for `--shared-dir=` — is
+      `/run/kata-containers/shared/sandboxes/<actor-uid>/shared`, with
+      one `c_<container-name>/rootfs` subdirectory per container (no
+      intermediate `containers/` level, unlike the guest-side path's
+      own naming). Also confirmed live: `virtiofsd --sandbox=namespace`
+      runs its own serving child in a *further*-nested, independently
+      unshared mount+PID namespace from the worker container's own —
+      `nsenter`ing directly into either virtiofsd PID failed
+      identically to the missing-`--pid` symptom above regardless of
+      flags tried, consistent with its mount namespace's own `/proc`
+      never having been freshly (re-)mounted against its paired PID
+      namespace. Entering the *worker* container's own namespace
+      instead (not virtiofsd's) and writing through that same backing
+      path worked correctly on the first try — there was never a need
+      to enter virtiofsd's own sandbox at all.
+    - **Final rootfs, with the fixed wrapper and embedded `gnwes-nsdbg`
+      baked in, confirmed live on a genuine cold boot with zero manual
+      steps**: `kubectl-ate create actor` + `resume actor` against a
+      freshly recreated worker pod produced, with no human touching
+      `nsenter` at all, `nvidia.ko` bound (`NVRM: loading NVIDIA UNIX
+      Open Kernel Module...`), `container_pid` found, `mknod` run, and
+      — checked directly via the debug console's `ls -la
+      /proc/<container-pid>/root/dev/` — real `crw-------` character
+      device nodes for `nvidia-uvm` (239,0), `nvidia0` (195,0) and
+      `nvidiactl` (195,255) inside the actor's own view of `/dev`.
+      Opening `/dev/nvidiactl` from inside that same namespace (via
+      `gnwes-nsdbg cat`, reinstalled temporarily through the same
+      virtiofs-backing-path technique) succeeded — the only error was
+      `EINVAL` on the subsequent `read()`, which is NVIDIA's own
+      correct, expected behavior for a control device meant for
+      `ioctl()`, not sequential reads; a permission problem would have
+      failed the `open()` itself with `EACCES`, not the `read()` with
+      `EINVAL`. This is the first real, conclusive, fully-automated
+      confirmation in this project that an Exclusive-tier actor
+      container can actually open its hot-attached GPU's device nodes,
+      not just that the driver loaded one mount namespace away. Final
+      rootfs sha256:
+      `4f0032775206947097e340f0c04b807c5c46155182eb0d189eaa0839289ceef0`
+      (kernel unchanged from the `c3b5598732...` entry above; this
+      supersedes every earlier rootfs sha256 in this document, all of
+      which lacked the container-device-node fix).
   - Detach found and fixed two real bugs in
     `VMGPUAttachmentReconciler.reconcileDetach`: Agent Substrate's actor
     `suspend` fully tears down the microVM's whole working directory (not

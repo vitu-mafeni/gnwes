@@ -693,6 +693,122 @@ the polling one -- see `config/vmgpu/README.md`'s "real fix" entry under
 the init-wrapper discussion and `build-nvidia-kata-image.sh`'s
 `install_init_wrapper` step.
 
+### 4.8 — check whether the actor container itself can actually open the GPU
+
+`nvidia.ko` binding in the guest kernel (4.7) is necessary but not
+sufficient: the actor container's own `/dev` is a *private tmpfs*,
+never shared with guest root's `/dev` (confirmed from kata-agent's own
+OCI spec dump), so a device bound one mount namespace over is still
+invisible inside the container unless the init wrapper's own
+`mknod`-into-container step (`config/vmgpu/README.md`'s 2026-11-16
+"Container-level GPU device access" entry) also ran successfully. This
+needs real interactive access *inside the guest*, reachable only via
+Kata's own debug console (vsock port 1026) -- there is no exec access
+into the guest OS any other way, and the demo app's own container has
+no shell at all to `kubectl exec` into.
+
+**Enable the debug console** (one-time, per WorkerPool; no CRD field
+exists for this on purpose -- it is a debugging stopgap, not a
+supported API):
+
+```bash
+kubectl annotate workerpool <pool-name> -n ate-demo-counter gnwes.io/guest-debug=true --overwrite
+kubectl delete pod -n ate-demo-counter -l ate.dev/worker-pool=<pool-name>   # force the new arg to actually take effect
+```
+
+This only works against an `atecontroller` build that recognizes the
+annotation -- `cmd/atecontroller/internal/controllers/workerpool_apply.go`'s
+`buildDeploymentApplyConfig` must have the `gnwes.io/guest-debug` gate
+(a direct `kubectl patch` of the Deployment's own `args` does **not**
+survive: confirmed live, reverted by atecontroller's SSA reconcile
+within 5 seconds). Also requires `agent-substrate`'s
+`cmd/ateworker-microvm/internal/kata/config.go`'s `WithAgentDebug` to
+use `agent.log=info`, not `agent.log=debug` -- the louder log level
+alone crashes kata-agent 4.3.1 on this guest (a real
+general-protection-fault in its own async-logging thread within
+~1.4s of boot, confirmed live via the console log), independent of
+the debug console itself.
+
+**Find the VM's vsock socket and the worker's own host PID**, then
+dial the console with `cmd/nsdbg`'s `dial` subcommand (build it with
+`CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o nsdbg ./cmd/nsdbg`
+-- it must be statically linked, confirmed via `file`, or none of this
+works once it is exec'd into a container's namespace):
+
+```bash
+# on the GPU node (dcn-gpu-0), after kubectl-ate resume actor:
+WORKER_PID=$(for p in /proc/[0-9]*; do grep -qs ateworker-microvm "$p/cmdline" 2>/dev/null && echo "${p#/proc/}" && break; done)
+VM_ID=$(kubectl logs -n ate-demo-counter <worker-pod> -c worker --tail=50 | grep -o '"Micro-VM booted".*"id":"[a-f0-9-]*"' | grep -o '[a-f0-9-]\{36\}' | tail -1)
+echo "worker_pid=$WORKER_PID vm_id=$VM_ID"
+
+sudo bash -c "
+exec 3</path/to/nsdbg
+nsenter --target $WORKER_PID --mount --pid -- /proc/self/fd/3 dial /run/vc/vm/$VM_ID/clh.sock 1026 'id; uname -a'
+"
+# expect: uid=0(root) ... and the guest's own kernel release string --
+# this confirms the console is reachable at all before trying anything else.
+```
+
+**--mount alone is enough here** (no `--pid` needed) because the
+*worker* container has no nested PID namespace of its own. `--pid`
+only becomes necessary once the target itself has unshared a further
+PID namespace -- which both a Kata container and `virtiofsd
+--sandbox=namespace`'s own serving child do. If this `nsenter` ever
+fails with `nsenter: failed to execute /proc/self/fd/3: No such file
+or directory` for a *different* target PID, check first whether that
+target has its own nested PID namespace (`readlink
+/proc/<pid>/ns/pid` vs `/proc/self/ns/pid`) before suspecting anything
+about the file itself.
+
+**Find the counter container's own PID inside the guest**, then check
+its `/dev` directly:
+
+```bash
+sudo bash -c "
+exec 3</path/to/nsdbg
+nsenter --target $WORKER_PID --mount --pid -- /proc/self/fd/3 dial /run/vc/vm/$VM_ID/clh.sock 1026 \\
+  'for p in /proc/[0-9]*; do grep -qs /ko-app/ \$p/cmdline 2>/dev/null && echo CPID=\${p#/proc/}; done; ls -la /proc/122/root/dev/'
+"
+```
+
+**Expect**: `crw-------` (or `crw-r--r--`/`crw-rw-rw-` depending on
+the exact `gnwes-nsdbg` build) entries for `nvidia-uvm` (major 239 on
+this cluster, but always confirm via `/proc/devices` -- it is assigned
+dynamically), `nvidia0` and `nvidiactl` (both major 195), inside
+`/proc/<container-pid>/root/dev/`, with no manual `nsenter`/`mknod`
+required -- the init wrapper already did it automatically during boot.
+If `/dev` only has the stock entries (`null`, `zero`, `tty`, ...) and
+none of the three NVIDIA ones, check the console log for
+`GNWES_GPU_WRAPPER: mknod attempts done, output follows:` and whatever
+printed after it -- an empty body means every `mknod` call succeeded
+(this tool only prints on error), so a missing node there points at
+the wrapper not finding `$CPID` or `$ROOTFS_SRC` at all (both logged
+right before this step), not at the mknod technique itself.
+
+**Confirm it is actually openable, not just present** (same technique,
+after temporarily reinstalling `gnwes-nsdbg` into the container's
+rootfs bind-mount source -- see `cmd/nsdbg/main.go`'s own doc comment
+for exactly where that source directory lives, which is *not* the
+same path as the guest's own mount point name):
+
+```bash
+# host-side worker PID, writes through to the guest via virtiofs:
+VM_UID=$VM_ID   # the actor UID == the VM id throughout this project
+sudo bash -c "
+exec 3</path/to/nsdbg
+nsenter --target $WORKER_PID --mount --pid -- /proc/self/fd/3 install /run/kata-containers/shared/sandboxes/$VM_UID/shared/c_counter/rootfs/gnwes-nsdbg
+"
+sudo bash -c "
+exec 3</path/to/nsdbg
+nsenter --target $WORKER_PID --mount --pid -- /proc/self/fd/3 dial /run/vc/vm/$VM_ID/clh.sock 1026 \\
+  'nsenter --target 122 --mount --pid -- /gnwes-nsdbg cat /dev/nvidiactl; echo EXIT=\$?; rm -f /gnwes-nsdbg'
+"
+# expect: EXIT=1 with "invalid argument" -- this is NVIDIA's own
+# correct behavior for a control device meant for ioctl(), not
+# sequential reads. A permission problem would fail the open() itself
+# with "permission denied" (EACCES), not the later read() with EINVAL.
+```
+
 ## Phase 5 — Shared tier real Volcano vGPU slicing, run for real 2026-11-15
 
 This exercises real fractional GPU *sharing* on the Shared tier — several

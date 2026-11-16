@@ -24,7 +24,18 @@
 # init-wrapper at /usr/bin/kata-agent (modprobes the 4 modules, then
 # execs the real binary renamed to kata-agent.real) -- see
 # config/vmgpu/README.md's "init-PID1" entry and
-# build-nvidia-kata-image.sh's install_init_wrapper step.
+# build-nvidia-kata-image.sh's install_init_wrapper step. That same
+# wrapper also mknods /dev/nvidiactl, /dev/nvidia0 and /dev/nvidia-uvm
+# inside the actor container's own mount namespace (its /dev is a
+# private tmpfs, never shared with guest root's /dev) using
+# cmd/nsdbg, a statically-linked helper embedded in this rootfs at
+# /usr/local/bin/gnwes-nsdbg -- see README.md's 2026-11-16
+# "Container-level GPU device access" entry for the full story
+# (why a plain nsenter + coreutils mknod does not work here, and the
+# two fixes that make it work: --pid alongside --mount, and a
+# genuinely static binary). This image also has that same
+# gnwes-nsdbg helper available at /usr/local/bin/gnwes-nsdbg in guest
+# root, if more debugging is ever needed.
 #
 # The cloud-hypervisor/virtiofsd asset entries below are copied
 # VERBATIM from this cluster's existing "microvm" SandboxConfig as of
@@ -59,5 +70,5 @@ spec:
           sha256: c3b5598732fc3b7ae79b55588e7a475134f7c422272add4bc91f8c1967f3559a
           url: s3://ate-snapshots/microvm-assets/amd64/c3b5598732fc3b7ae79b55588e7a475134f7c422272add4bc91f8c1967f3559a
         kata-image:
-          sha256: e907f66c9e03e8e26b71f20953af1f72b8d325108279ae810643966acdd7949c
-          url: s3://ate-snapshots/microvm-assets/amd64/e907f66c9e03e8e26b71f20953af1f72b8d325108279ae810643966acdd7949c
+          sha256: 4f0032775206947097e340f0c04b807c5c46155182eb0d189eaa0839289ceef0
+          url: s3://ate-snapshots/microvm-assets/amd64/4f0032775206947097e340f0c04b807c5c46155182eb0d189eaa0839289ceef0
