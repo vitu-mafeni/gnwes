@@ -982,6 +982,56 @@ behind it is unit-tested (see `internal/substratebridge/kubectlate_test.go`).
   deliberate choice given no real cloud-hypervisor to test the transitional
   case against, not a settled answer.
 
+**Resolved 2026-11-16 — a real, non-ko-built container actually using the
+hot-attached GPU is now confirmed end-to-end**, on the custom NVIDIA kata
+image `build-nvidia-kata-image.sh` built and uploaded 2026-11-15 (above).
+`config/vmgpu/nvidia-smi-test/` runs the real `nvidia-smi` binary (not a Go
+app) in an actor container on `gnwes-counter-exclusive`; a real `kubectl-ate
+resume actor` produced `nvidia-smi`'s genuine output from inside the guest —
+real driver version, real `NVIDIA TITAN RTX`, real 24576MiB, exit 0 — not
+just `lspci` enumeration or an open device node. Getting here needed three
+more real bugs fixed, none of them specific to NVIDIA:
+
+- **The open kernel modules need a GSP firmware blob** this build never
+  copied in (`RmInitAdapter` failing with "No firmware image found"), and
+  the stock rootfs had nowhere near enough free space for it once added —
+  both fixed in `build-nvidia-kata-image.sh` (see its own 2026-11-16
+  comments: the GSP-firmware copy, and growing the image/partition/
+  filesystem by 128MB, including relocating a second, non-rootfs partition
+  that blocked simply growing the last one).
+- **A genuine, host-level cloud-hypervisor virtio-pmem bug**: every cold
+  boot's guest kernel panicked mounting root from pmem0p1 with a specific,
+  100% reproducible wrong geometry — rigorously proven, via a live read
+  through cloud-hypervisor's own open fd during an actual failing boot, to
+  be independent of the backing file's content (byte-for-byte correct at
+  the exact moment the guest, within the same second, reported a different
+  disk entirely), and reproduced identically across cloud-hypervisor
+  v53.0/v54.0 and both `DiscardWrites` settings, ruling out both the VMM
+  version and the mapping mode. Fixed on the `agent-substrate` side (kept
+  local there, not upstreamed, until confirmed further) by switching the
+  guest image from virtio-pmem to virtio-blk — a different code path on
+  both sides, sidestepping the bug entirely since container rootfs reads
+  never needed pmem's DAX benefit anyway.
+- **`VMGPUAttachmentReconciler`'s `Status().Update()` calls had no
+  conflict-retry**, and once a real actor's VM survived long enough to
+  reach `vm.add-device` (the pmem bug above made that unreachable before
+  now), they conflicted on essentially every attempt — `status.phase` never
+  actually reached `Attached` or any other terminal state, it just sat on
+  whatever the last clean write had been, forever, while the real GPU never
+  got hot-attached and `nvidia-smi` exhausted its own retries. Fixed by
+  re-GETting and reapplying the same status mutation on a conflict instead
+  of surfacing the error (which controller-runtime treats as "ignore this
+  reconcile's `RequeueAfter`, use my own default backoff instead").
+
+Also needed, after this node's own reboot mid-investigation: `cmd/manager`
+must run **on the GPU node itself** (`dcn-gpu-0`, not the control-plane
+node) **as root** — `resolveRealAPISocket`'s `os.Stat` calls need to see
+`/var/lib/gnwes/vcvm/<vcVMID>/<actorUID>/` (`drwx------ root:root`), and a
+process on a different node can never see that path at all regardless of
+privilege. Neither requirement is new, but a reboot recovery that restarts
+`cmd/manager` without both can silently reproduce the exact
+`resolveRealAPISocket` failure mode its own doc comment already describes.
+
 ## Testing without real hardware
 
 `cmd/fakevmm` is a small stand-in VMM server (not part of the production
